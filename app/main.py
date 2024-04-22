@@ -5,7 +5,7 @@ class redis_parser(object):
     @classmethod
     def parse(self, data):
         if len(data) == 0:
-            return
+            return ['']
 
         lines = data.splitlines()
         startline = lines[0]
@@ -36,25 +36,31 @@ def main():
 
     # Uncomment this to pass the first stage
 
-    server_socket = socket.create_server(("localhost", 6379), reuse_port=True)
-    client_socket, addr = server_socket.accept() # wait for client
+    server_socket = socket.create_server(("localhost", 6379), backlog=2, reuse_port=True)
 
-    print('Incoming connection from', addr)
+    MAX_CONN = 2
+    num_conn = 0
 
-    with client_socket:
-        while True:
-            request_bytes = client_socket.recv(4096)
-            if not request_bytes:
-                break
+    while num_conn < MAX_CONN:
+        client_socket, addr = server_socket.accept() # wait for client
 
-            request = request_bytes.decode('utf-8')
+        print('Incoming connection from', addr)
 
-            # Parser redis packet
-            command, *args = redis_parser.parse(request)
+        with client_socket:
+            while True:
+                request_bytes = client_socket.recv(4096)
+                if not request_bytes:
+                    break
 
-            if command.upper() == 'PING':
-                client_socket.sendall(b'+PONG\r\n')
+                request = request_bytes.decode('utf-8')
 
+                # Parser redis packet
+                command, *args = redis_parser.parse(request)
+
+                if command.upper() == 'PING':
+                    client_socket.sendall(b'+PONG\r\n')
+
+        num_conn += 1
 
 if __name__ == "__main__":
     main()
