@@ -1,4 +1,5 @@
 # Uncomment this to pass the first stage
+import sys
 import socket
 from threading import Thread
 
@@ -13,18 +14,23 @@ class redis_parser(object):
         lines.pop(0)
 
         issimple = True if startline[0] == '+' else False
-        iscommand = True if startline[0] == '*' else False
+        isarray = True if startline[0] == '*' else False
 
-        nparams = nparams = int(startline[1:]) if iscommand else 1
+        if issimple:
+            if lines[i][0] != '+':
+                raise RuntimeError('Invalid data')
+
+            return [lines[i][1:]]
+
+        nparams = nparams = int(startline[1:]) if isarray else 1
 
         params = []
         for i in range(nparams):
-            if lines[i][0] != '$':
+            if lines[i * 2][0] != '$':
                 raise RuntimeError('Invalid data')
 
-            nbytes = int(lines[i][1:])
-            param = lines[i+1][:nbytes]
-
+            nbytes = int(lines[i * 2][1:])
+            param = lines[i * 2 + 1][:nbytes]
             params.append(param)
 
         return params
@@ -41,14 +47,32 @@ def handle_client(client_socket):
 
             request = request_bytes.decode('utf-8')
 
-            # Parser redis packet
+            # Parse redis packet
             command, *args = redis_parser.parse(request)
 
-            if command.upper() == 'COMMAND':
-                response = b'*1\r\n$4\r\nping\r\n'
+            response = None
 
-            elif command.upper() == 'PING':
-                response = b'+PONG\r\n'
+            try:
+                if command.upper() == 'COMMAND':
+                    response = b'*2\r\n$4\r\nping\r\n$4\r\necho\r\n'
+
+                elif command.upper() == 'PING':
+                    response = b'+PONG\r\n'
+
+                elif command.upper() == 'ECHO':
+                    if len(args) > 0:
+                        arglen = len(args[0])
+                        response = f'${arglen}\r\n{args[0]}\r\n'.encode()
+
+            except Exception as e:
+                sys.stderr.write(f'Exception occurred: {e}\n')
+
+            finally:
+                # Error
+                if response is None:
+                    arg1 = args[0] if len(args) > 0 else ''
+                    response = f'-ERR unknown command `{command}`, '\
+                               f'with args beginning with: {arg1}\r\n'.encode()
 
             client_socket.sendall(response)
 
