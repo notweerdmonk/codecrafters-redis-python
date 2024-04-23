@@ -288,6 +288,11 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 def main():
+    # Get port number
+    port = 6379
+    if len(sys.argv) == 3 and sys.argv[1] == '--port':
+        port = int(sys.argv[2])
+
     # Start thread to check for key expiry
     expiry_thread = Thread(target=check_expiry)
     expiry_thread.start()
@@ -297,7 +302,7 @@ def main():
 
     # Uncomment this to pass the first stage
 
-    server_socket = socket.create_server(("localhost", 6379),
+    server_socket = socket.create_server(("localhost", port),
                                          backlog=2,
                                          reuse_port=True)
 
