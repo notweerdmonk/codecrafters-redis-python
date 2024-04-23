@@ -7,9 +7,14 @@ from enum import Enum
 import time
 import random
 from dataclasses import dataclass
+import argparse
 
 def millis():
-    return time.time() * 1000
+    return int(time.time() * 1000)
+
+class ServerRole(Enum):
+    MASTER = 'master'
+    SLAVE = 'slave'
 
 class RESP_parser(object):
     @classmethod
@@ -157,7 +162,7 @@ class Store(object):
             e = self._store[key]
             if e.expiry < 0:
                 return False
-            if e.expiry > int(time.time() * 1000):
+            if e.expiry > millis():
                 return False
 
             self._store.pop(key)
@@ -174,7 +179,7 @@ class Store(object):
     # notice formatting
     def set(self, key, value, expiry=-1):
         with self._lock:
-            self._store[key] = StoreElement(value, (int(time.time() * 1000) + expiry) if expiry != -1 else expiry)
+            self._store[key] = StoreElement(value, (millis() + expiry) if expiry != -1 else expiry)
 
     def get(self, key):
         with self._lock:
@@ -182,14 +187,16 @@ class Store(object):
                 return ''
             
             e = self._store[key]
-            if e.expiry > 0 and e.expiry <= int(time.time() * 1000):
+            if e.expiry > 0 and e.expiry <= millis():
                 self._store.pop(key)
                 return ''
             return e.value
 
 store = Store()
+server_role = ServerRole(ServerRole.MASTER)
 
 def process_command(command, args):
+    global store
     response = None
 
     command = command.upper()
@@ -212,7 +219,7 @@ def process_command(command, args):
             subcommand = args[0].upper()
             
         if subcommand == 'REPLICATION':
-            payload = f'# Replication\r\nrole:master\r\n'
+            payload = f'# Replication\r\nrole:{server_role.value}\r\n'
             response = RESP_builder.build(payload)
 
         else:
@@ -286,6 +293,7 @@ def handle_client(client_socket):
             client_socket.sendall(response)
 
 def check_expiry():
+    global store
     CHECK_INTERVAL = 300 # seconds
 
     while True:
@@ -303,10 +311,27 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 def main():
+    global server_role
+
     # Get port number
     port = 6379
     if len(sys.argv) == 3 and sys.argv[1] == '--port':
         port = int(sys.argv[2])
+
+    parser = argparse.ArgumentParser(description='Dummy Redis Server')
+    parser.add_argument('--port', type=int, help='Port number')
+    parser.add_argument('--replicaof', nargs=2, metavar=('host', 'port'), help='Set the host and port of the master to replicate')
+
+    args = parser.parse_args()
+
+    if args.port:
+        port = args.port
+
+    print(f'Running on port: {port}')
+
+    if args.replicaof:
+        server_role = ServerRole.SLAVE
+        print(f'Set as slave replicating {args.replicaof[0]}:{args.replicaof[1]}')
 
     # Start thread to check for key expiry
     expiry_thread = Thread(target=check_expiry)
