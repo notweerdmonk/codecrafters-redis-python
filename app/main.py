@@ -192,19 +192,33 @@ store = Store()
 def process_command(command, args):
     response = None
 
-    if command.upper() == 'COMMAND':
+    command = command.upper()
+
+    if command == 'COMMAND':
         response = RESP_builder.build(['ping', 'echo'])
 
-    elif command.upper() == 'PING':
+    elif command == 'PING':
         response = RESP_builder.build('PONG', bulkstr=False)
 
-    elif command.upper() == 'ECHO':
+    elif command == 'ECHO':
         if len(args) == 0:
             return RESP_builder.error(command)
 
         response = RESP_builder.build(args[0])
 
-    elif command.upper() == 'SET':
+    elif command == 'INFO':
+        subcommand = ''
+        if len(args) >= 1:
+            subcommand = args[0].upper()
+            
+        if subcommand == 'REPLICATION':
+            payload = f'# Replication\r\nrole:master\r\n'
+            response = RESP_builder.build(payload)
+
+        else:
+            response = RESP_builder.error(args='not implemented', typ=RESP_error.CUSTOM)
+
+    elif command == 'SET':
         if len(args) < 2:
             return RESP_builder.error(command)
 
@@ -220,7 +234,7 @@ def process_command(command, args):
 
         response = RESP_builder.build('OK', bulkstr=False)
 
-    elif command.upper() == 'GET':
+    elif command == 'GET':
         nargs = len(args)
         if nargs < 1:
             return RESP_builder.error(command)
@@ -272,18 +286,19 @@ def handle_client(client_socket):
             client_socket.sendall(response)
 
 def check_expiry():
-    CHECK_INTERVAL = 30 # seconds
+    CHECK_INTERVAL = 300 # seconds
 
     while True:
         MAX_LOT_SIZE = 20
 
         store_keys = store.keys()
         store_size = len(store_keys)
-        if store_size:
+        if store_size > 0:
             lot_size = store_size if store_size < MAX_LOT_SIZE else MAX_LOT_SIZE
             selected = random.sample(store_keys, lot_size)
             for key in selected:
-                print(f'Checking {key} expiry: {store.expired(key)}')
+                #print(f'Checking {key} expiry: {store.expired(key)}')
+                store.expired(key)
 
         time.sleep(CHECK_INTERVAL)
 
