@@ -8,6 +8,7 @@ import time
 import random
 from dataclasses import dataclass
 import argparse
+import secrets
 
 def millis():
     return int(time.time() * 1000)
@@ -15,6 +16,28 @@ def millis():
 class ServerRole(Enum):
     MASTER = 'master'
     SLAVE = 'slave'
+
+class Server(object):
+    _instance = None
+
+    def __init__(self, role: ServerRole = ServerRole.MASTER):
+        self._role = role
+        self.master_replid = secrets.token_hex(20)
+        self.master_repl_offset = 0
+
+    def __new__(cls, role: ServerRole = ServerRole.MASTER):
+        if cls._instance is None:
+            cls._instance = super(Server, cls).__new__(cls)
+            cls._instance.__init__(role)
+        return cls._instance
+
+    @property
+    def role(self):
+        return self._role.value
+
+    @role.setter
+    def role(self, role_: ServerRole):
+        self._role = role_
 
 class RESP_parser(object):
     @classmethod
@@ -147,7 +170,6 @@ class Store(object):
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(Store, cls).__new__(cls)
-            # Put any initialization here.
         return cls._instance
 
     def __init__(self):
@@ -193,7 +215,7 @@ class Store(object):
             return e.value
 
 store = Store()
-server_role = ServerRole(ServerRole.MASTER)
+server = Server(ServerRole.MASTER)
 
 def process_command(command, args):
     global store
@@ -219,7 +241,10 @@ def process_command(command, args):
             subcommand = args[0].upper()
             
         if subcommand == 'REPLICATION':
-            payload = f'# Replication\r\nrole:{server_role.value}\r\n'
+            payload = f'# Replication\r\n'\
+                      f'role:{server.role}\r\n'\
+                      f'master_replid:{server.master_replid}\r\n'\
+                      f'master_repl_offset:{server.master_repl_offset}\r\n'
             response = RESP_builder.build(payload)
 
         else:
@@ -311,7 +336,7 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 def main():
-    global server_role
+    global server
 
     # Get port number
     port = 6379
@@ -330,7 +355,7 @@ def main():
     print(f'Running on port: {port}')
 
     if args.replicaof:
-        server_role = ServerRole.SLAVE
+        server.role = ServerRole.SLAVE
         print(f'Set as slave replicating {args.replicaof[0]}:{args.replicaof[1]}')
 
     # Start thread to check for key expiry
