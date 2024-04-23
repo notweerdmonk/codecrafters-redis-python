@@ -356,7 +356,17 @@ def main():
 
     if args.replicaof:
         server.role = ServerRole.SLAVE
+        master_host = args.replicaof[0]
+        master_port = args.replicaof[1]
         print(f'Set as slave replicating {args.replicaof[0]}:{args.replicaof[1]}')
+
+        print('Connecting to master')
+
+        master_socket = socket.create_connection((master_host, master_port))
+
+        with master_socket:
+            ping = RESP_builder.build(['ping'])
+            master_socket.sendall(ping)
 
     # Start thread to check for key expiry
     expiry_thread = Thread(target=check_expiry)
