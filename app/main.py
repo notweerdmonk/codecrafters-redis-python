@@ -123,7 +123,7 @@ class RESP_builder(object):
         return '$-1\r\n'.encode()
 
     @classmethod
-    def build(cls, data: Union[int, str, list], bulkstr: bool = True):
+    def build(cls, data: Union[int, str, list], bulkstr: bool = True, rdb: bool = False):
         typ = type(data)
 
         if typ == int:
@@ -138,12 +138,18 @@ class RESP_builder(object):
             else:
                 return f'+{data}\r\n'.encode()
 
+        elif typ == bytes:
+            if rdb:
+                return f'${len(data)}\r\n'.encode() + data
+            else:
+                return cls.null()
+
         elif typ == list:
             return f'*{len(data)}\r\n'.encode() +\
                    ''.encode().join(map(cls.build, data))
 
         else:
-            raise TypeError(f"Unsupported type: {data_type}")
+            raise TypeError(f"Unsupported type: {typ}")
 
     @classmethod
     def error(
@@ -226,6 +232,11 @@ class Store(object):
 store = Store()
 server = Server()
 
+def rdb_contents():
+    hex_data = '524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2'
+
+    return bytes.fromhex(hex_data)
+
 def process_command(command, args):
     global store
     response = None
@@ -269,9 +280,9 @@ def process_command(command, args):
             return RESP_builder.error(command)
         if argslen == 2 and args[0] != '?' and args[1] != '-1':
             return RESP_builder.error(typ=RESP_error.SYNTAX)
-        # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n
+        # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n and RDB file contents
         # notice formatting
-        response = RESP_builder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False)
+        response = RESP_builder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESP_builder.build(rdb_contents(), rdb=True)
 
     elif command == 'SET':
         if len(args) < 2:
