@@ -20,16 +20,25 @@ class ServerRole(Enum):
 class Server(object):
     _instance = None
 
-    def __init__(self, role: ServerRole = ServerRole.MASTER):
+    def __init__(self, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+        self._port = port
         self._role = role
         self.master_replid = secrets.token_hex(20)
         self.master_repl_offset = 0
 
-    def __new__(cls, role: ServerRole = ServerRole.MASTER):
+    def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
         if cls._instance is None:
             cls._instance = super(Server, cls).__new__(cls)
-            cls._instance.__init__(role)
+            cls._instance.__init__(port, role)
         return cls._instance
+
+    @property
+    def port(self):
+        return self._port
+
+    @port.setter
+    def port(self, port_: int):
+        self._port = port_
 
     @property
     def role(self):
@@ -215,7 +224,7 @@ class Store(object):
             return e.value
 
 store = Store()
-server = Server(ServerRole.MASTER)
+server = Server()
 
 def process_command(command, args):
     global store
@@ -249,6 +258,10 @@ def process_command(command, args):
 
         else:
             response = RESP_builder.error(args='not implemented', typ=RESP_error.CUSTOM)
+
+    elif command == 'REPLCONF':
+        # Hardcode +OK\r\n
+        response = RESP_builder.build('OK', bulkstr=False)
 
     elif command == 'SET':
         if len(args) < 2:
@@ -338,22 +351,19 @@ def check_expiry():
 def main():
     global server
 
-    # Get port number
-    port = 6379
-    if len(sys.argv) == 3 and sys.argv[1] == '--port':
-        port = int(sys.argv[2])
-
     parser = argparse.ArgumentParser(description='Dummy Redis Server')
     parser.add_argument('--port', type=int, help='Port number')
     parser.add_argument('--replicaof', nargs=2, metavar=('host', 'port'), help='Set the host and port of the master to replicate')
 
     args = parser.parse_args()
 
+    # Get port number
     if args.port:
-        port = args.port
+        server.port = args.port
 
-    print(f'Running on port: {port}')
+    print(f'Running on port: {server.port}')
 
+    # Get master host and port
     if args.replicaof:
         server.role = ServerRole.SLAVE
         master_host = args.replicaof[0]
@@ -367,6 +377,15 @@ def main():
         with master_socket:
             ping = RESP_builder.build(['ping'])
             master_socket.sendall(ping)
+            master_socket.recv(4096)
+
+            replconf = RESP_builder.build(['REPLCONF', 'listening-port', str(server.port)])
+            master_socket.sendall(replconf)
+            master_socket.recv(4096)
+
+            replconf = RESP_builder.build(['REPLCONF', 'capa', 'psync2'])
+            master_socket.sendall(replconf)
+            master_socket.recv(4096)
 
     # Start thread to check for key expiry
     expiry_thread = Thread(target=check_expiry)
@@ -377,7 +396,7 @@ def main():
 
     # Uncomment this to pass the first stage
 
-    server_socket = socket.create_server(("localhost", port),
+    server_socket = socket.create_server(("localhost", server.port),
                                          backlog=2,
                                          reuse_port=True)
 
