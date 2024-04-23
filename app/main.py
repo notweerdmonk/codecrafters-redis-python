@@ -264,8 +264,9 @@ def process_command(command, args):
         response = RESP_builder.build('OK', bulkstr=False)
 
     elif command == 'PSYNC':
-        # Hardcode response
-        response = RESP_builder.build('FULLRESYNC <REPL_ID> 0', bulkstr=False)
+        # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n
+        # notice formatting
+        response = RESP_builder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False)
 
     elif command == 'SET':
         if len(args) < 2:
