@@ -263,6 +263,10 @@ def process_command(command, args):
         # Hardcode +OK\r\n
         response = RESP_builder.build('OK', bulkstr=False)
 
+    elif command == 'PSYNC':
+        # Hardcode response
+        response = RESP_builder.build('FULLRESYNC <REPL_ID> 0', bulkstr=False)
+
     elif command == 'SET':
         if len(args) < 2:
             return RESP_builder.error(command)
@@ -383,7 +387,11 @@ def main():
             master_socket.sendall(replconf)
             master_socket.recv(4096)
 
-            replconf = RESP_builder.build(['REPLCONF', 'capa', 'psync2'])
+            replconf = RESP_builder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
+            master_socket.sendall(replconf)
+            master_socket.recv(4096)
+
+            replconf = RESP_builder.build(['PSYNC', '?', '-1'])
             master_socket.sendall(replconf)
             master_socket.recv(4096)
 
