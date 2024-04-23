@@ -264,6 +264,11 @@ def process_command(command, args):
         response = RESP_builder.build('OK', bulkstr=False)
 
     elif command == 'PSYNC':
+        argslen = len(args)
+        if argslen == 1:
+            return RESP_builder.error(command)
+        if argslen == 2 and args[0] != '?' and args[1] != '-1':
+            return RESP_builder.error(typ=RESP_error.SYNTAX)
         # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n
         # notice formatting
         response = RESP_builder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False)
