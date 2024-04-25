@@ -9,170 +9,87 @@ import random
 from dataclasses import dataclass
 import argparse
 import secrets
+#from __future__ import annotations
 
 def millis():
     return int(time.time() * 1000)
 
-class ServerRole(Enum):
-    MASTER = 'master'
-    SLAVE = 'slave'
+@dataclass
+class Message(object):
+    payload: bytes
+    command: str
+    args: list
 
-class Server(object):
-    _instance = None
+class Queue(object):
+    def _reset(self):
+        self._front = self._rear = -1
 
-    def __init__(self, port: int = 6379, role: ServerRole = ServerRole.MASTER):
-        self._port = port
-        self._role = role
-        self.master_replid = secrets.token_hex(20)
-        self.master_repl_offset = 0
+    def __init__(self, element, capacity: int = 64):
+        self._lock: Lock = Lock()
+        self._reset()
+        self._capacity = capacity
+        self._data = [element] * self._capacity
 
-    def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
-        if cls._instance is None:
-            cls._instance = super(Server, cls).__new__(cls)
-            cls._instance.__init__(port, role)
-        return cls._instance
+    def is_empty(self):
+        return self._front == -1
 
-    @property
-    def port(self):
-        return self._port
+    def is_full(self):
+        return self._rear == self._capacity - 1
 
-    @port.setter
-    def port(self, port_: int):
-        self._port = port_
+    def enqueue(self, element):
+        with self._lock:
+            if self.is_full(): return
 
-    @property
-    def role(self):
-        return self._role.value
+            self._rear += 1
+            self._data[self._rear] = element
+            if self.is_empty():
+                self._front += 1
 
-    @role.setter
-    def role(self, role_: ServerRole):
-        self._role = role_
+    def peek(self):
+        with self._lock:
+            if self.is_empty(): return None
 
-class RESP_parser(object):
-    @classmethod
-    def _parse_internal(cls, lines):
-        if len(lines) == 0:
-            return ['']
+            return self._data[self._front]
+        
+    def dequeue(self):
+        with self._lock:
+            if self.is_empty(): return None
 
-        startline = lines[0]
-        lines.pop(0)
+            element = self._data[self._front]
+            self._front += 1
+            if self._front > self._rear:
+                self._reset()
 
-        params = []
-        n = 1
+            return element
 
-        # integer
-        if startline.startswith(':'):
-            return n, int(startline[1:])
+class DynQueue(object):
+    def __init__(self):
+        self._lock: Lock = Lock()
+        self._size = 0
+        self._data = []
 
-        # simple string
-        elif startline.startswith('+'):
-            return n, startline[1:]
+    def is_empty(self):
+        return self._size == 0
 
-        # bulk string
-        elif startline.startswith('$'):
-            nbytes = int(startline[1:])
-            if len(lines) < 1:
-                raise RuntimeError('Invalid data')
-            if len(lines[0]) < nbytes:
-                raise RuntimeError('Bulk string data fell short')
-            param = lines[0][:nbytes]
-            lines.pop(0)
-            n += 1
-            return n, param
+    def enqueue(self, element):
+        with self._lock:
+            self._data.append(element)
+            self._size += 1
 
-        # array
-        elif startline.startswith('*'):
-            nparams = int(startline[1:])
+    def peek(self):
+        with self._lock:
+            if self.is_empty(): return None
 
-            for i in range(nparams):
-                nchild, paramschild = cls._parse_internal(lines)
+            return self._data[0]
+        
+    def dequeue(self):
+        with self._lock:
+            if self.is_empty(): return None
 
-                params.append(paramschild)
-                n += nchild
+            element = self._data.pop(0)
+            self._size -= 1
 
-        return n, params
-
-    @classmethod
-    def parse(cls, data):
-        if len(data) == 0:
-            return ['']
-
-        lines = data.splitlines()
-        nlines = len(lines)
-
-        n, params = cls._parse_internal(lines)
-
-        if nlines != n:
-            raise RuntimeError('Invalid data')
-
-        return params
-
-    def __init__(self, data):
-        self.params = self.parse(data)
-
-class RESP_error(Enum):
-    WRONG_ARGS = 1
-    UNKNOWN_CMD = 2
-    SYNTAX = 3
-    CUSTOM = 4
-
-class RESP_builder(object):
-
-    @classmethod
-    def null(cls):
-        return '$-1\r\n'.encode()
-
-    @classmethod
-    def build(cls, data: Union[int, str, list], bulkstr: bool = True, rdb: bool = False):
-        typ = type(data)
-
-        if typ == int:
-            return f':{data}\r\n'
-
-        elif typ == str:
-            if len(data) == 0:
-                return cls.null()
-
-            if bulkstr:
-                return f'${len(data)}\r\n{data}\r\n'.encode()
-            else:
-                return f'+{data}\r\n'.encode()
-
-        elif typ == bytes:
-            if rdb:
-                return f'${len(data)}\r\n'.encode() + data
-            else:
-                return cls.null()
-
-        elif typ == list:
-            return f'*{len(data)}\r\n'.encode() +\
-                   ''.encode().join(map(cls.build, data))
-
-        else:
-            raise TypeError(f"Unsupported type: {typ}")
-
-    @classmethod
-    def error(
-        cls, command: str = '', args: list = None,
-        typ: RESP_error = RESP_error.WRONG_ARGS
-    ):
-        if typ == RESP_error.WRONG_ARGS:
-            return '-ERR wrong number of arguments for '\
-                    f'\'{command}\' command\r\n'.encode()
-
-        elif typ == RESP_error.UNKNOWN_CMD:
-            arg1 = args[0] if len(args) > 0 else ''
-            return f'-ERR unknown command `{command}`, '\
-                   f'with args beginning with: {arg1}\r\n'.encode()
-
-        elif typ == RESP_error.SYNTAX:
-            return '-ERR syntax error\r\n'.encode()
-
-        elif typ == RESP_error.CUSTOM:
-            return f'-ERR {args}\r\n'.encode()
-
-        else:
-            raise RuntimeError('Unknown error type')
+            return element
 
 @dataclass
 class StoreElement(object):
@@ -229,31 +146,339 @@ class Store(object):
                 return ''
             return e.value
 
+    def delete(self, key):
+        with self._lock:
+            if key not in self._store:
+                return 0
+
+            self._store.pop(key)
+            return 1
+
+class Connection(object):
+    def send_relayed_msgs(self):
+        # relay commands from master
+        while True:
+            while not self._msgq.is_empty():
+                msg = self._msgq.dequeue()
+                self.send(msg.payload)
+
+    def __init__(
+        self,
+        socket: socket.socket,
+        addr: tuple,
+        server: 'Server',
+        isreplica=False
+    ):
+        self._socket = socket
+        self._addr = addr
+        self._server = server
+        self._thread = None
+        self._isreplica = isreplica
+        self._msgq = Queue(element=Message(b'', '', []))
+
+        self._relay_thread = Thread(target=self.send_relayed_msgs)
+
+    @property
+    def addr(self):
+        return self._addr
+
+    def set_thread(self, t):
+        self._thread = t
+
+    def start(self):
+        self._relay_thread.start()
+        self._thread.start()
+
+    def join(self):
+        self._relay_thread.join()
+        self._thread.join()
+
+    def set_replica(self):
+        self.isreplica = True
+        self._server.add_replica(self)
+        print(f'Connection {self._addr} set as replica')
+        
+    def relay(self, payload: bytes, command: str, args: list):
+        msg = Message(payload=payload, command=command, args=args)
+        self._msgq.enqueue(msg)
+
+    def send(self, data: bytes):
+        ndata = len(data)
+        nsent = 0
+        nbytes = 0
+        while (ndata > 0):
+            nbytes = self._socket.send(data[nbytes:])
+            nsent += nbytes
+            ndata -= nbytes
+
+        return nsent
+
+    def handle_connection(self):
+        with self._socket:
+            while True:
+                request_bytes = self._socket.recv(4096)
+                if not request_bytes:
+                    break
+
+                #request = request_bytes.decode('utf-8')
+    
+                # Parse RESP packet
+                command, *args = RESPparser.parse(request_bytes)
+
+                command = command.upper()
+    
+                if command in ['SET', 'DEL']:
+                    self._server.relay(request_bytes, command, args)
+
+                response = None
+    
+                try:
+                    response = process_command(command, args, self)
+    
+                except ValueError as v:
+                    sys.stderr.write(f'ValueError: {v}\n')
+                    response = RESPbuilder.error(args='value is not an integer or out of range', typ=RESPerror.CUSTOM) 
+    
+                except Exception as e:
+                    sys.stderr.write(f'Exception occurred: {e}\n')
+    
+                finally:
+                    # Default response
+                    if response is None or response == '':
+                        response =  RESPbuilder.error(
+                            command, args, typ=RESPerror.UNKNOWN_CMD
+                        )
+    
+                self._socket.sendall(response)
+
+class ServerRole(Enum):
+    MASTER = 'master'
+    SLAVE = 'slave'
+
+class Server(object):
+    _instance = None
+
+    def __init__(self, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+        self._host = 'localhost'
+        self._port = port
+        self._role = role
+        self._replicas = []
+        self._msgq = Queue(element=Message(b'', '', []))
+
+        self.master_replid = secrets.token_hex(20)
+        self.master_repl_offset = 0
+
+    def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+        if cls._instance is None:
+            cls._instance = super(Server, cls).__new__(cls)
+            cls._instance.__init__(port, role)
+        return cls._instance
+
+    @property
+    def port(self):
+        return self._port
+
+    @port.setter
+    def port(self, port_: int):
+        self._port = port_
+
+    @property
+    def role(self):
+        return self._role.value
+
+    @role.setter
+    def role(self, role_: ServerRole):
+        self._role = role_
+
+    def add_replica(self, conn: Connection):
+        self._replicas.append(conn)
+
+    def relay(self, payload: bytes, command: str, args: list):
+        msg = Message(payload=payload, command=command, args=args)
+        self._msgq.enqueue(msg)
+
+    def do_relay(self):
+        while True:
+            msg = self._msgq.peek()
+            if msg:
+                sent = False
+                for r in self._replicas:
+                    print(f'Relay to replica {r.addr} msg: {msg}')
+                    r.relay(msg.payload, msg.command, msg.args)
+                    sent = True
+                if sent:
+                    self._msgq.dequeue()
+
+class RESPparser(object):
+    @classmethod
+    def _parse_internal(cls, lines):
+        if len(lines) == 0:
+            return ['']
+
+        startline = lines[0].decode()
+        lines.pop(0)
+
+        params = []
+        n = 1
+
+        # integer
+        if startline.startswith(':'):
+            return n, int(startline[1:])
+
+        # simple string
+        elif startline.startswith('+'):
+            return n, startline[1:]
+
+        # bulk string
+        elif startline.startswith('$'):
+            nbytes = int(startline[1:])
+            if len(lines) < 1:
+                raise RuntimeError('Invalid data')
+            line = lines[0].decode()
+            if len(line) < nbytes:
+                raise RuntimeError('Bulk string data fell short')
+            param = line[:nbytes]
+            lines.pop(0)
+            n += 1
+            return n, param
+
+        # array
+        elif startline.startswith('*'):
+            nparams = int(startline[1:])
+
+            for i in range(nparams):
+                nchild, paramschild = cls._parse_internal(lines)
+
+                params.append(paramschild)
+                n += nchild
+
+        return n, params
+
+    @classmethod
+    def parse(cls, data):
+        if len(data) == 0:
+            return ['']
+
+        lines = data.splitlines()
+        nlines = len(lines)
+
+        n, params = cls._parse_internal(lines)
+
+        if nlines != n:
+            raise RuntimeError('Invalid data')
+
+        return params
+
+    def __init__(self, data):
+        self.params = self.parse(data)
+
+class RESPerror(Enum):
+    WRONG_ARGS = 1
+    UNKNOWN_CMD = 2
+    SYNTAX = 3
+    CUSTOM = 4
+
+class RESPbuilder(object):
+
+    @classmethod
+    def null(cls):
+        return '$-1\r\n'.encode()
+
+    @classmethod
+    def build(cls, data: Union[int, str, list], bulkstr: bool = True, rdb: bool = False):
+        typ = type(data)
+
+        if typ == int:
+            return f':{data}\r\n'.encode()
+
+        elif typ == str:
+            if len(data) == 0:
+                return cls.null()
+
+            if bulkstr:
+                return f'${len(data)}\r\n{data}\r\n'.encode()
+            else:
+                return f'+{data}\r\n'.encode()
+
+        elif typ == bytes:
+            if rdb:
+                return f'${len(data)}\r\n'.encode() + data
+            else:
+                return cls.null()
+
+        elif typ == list:
+            return f'*{len(data)}\r\n'.encode() +\
+                   ''.encode().join(map(cls.build, data))
+
+        else:
+            raise TypeError(f"Unsupported type: {typ}")
+
+    @classmethod
+    def error(
+        cls, command: str = '', args: list = None,
+        typ: RESPerror = RESPerror.WRONG_ARGS
+    ):
+        if typ == RESPerror.WRONG_ARGS:
+            return '-ERR wrong number of arguments for '\
+                    f'\'{command}\' command\r\n'.encode()
+
+        elif typ == RESPerror.UNKNOWN_CMD:
+            arg1 = args[0] if len(args) > 0 else ''
+            return f'-ERR unknown command `{command}`, '\
+                   f'with args beginning with: {arg1}\r\n'.encode()
+
+        elif typ == RESPerror.SYNTAX:
+            return '-ERR syntax error\r\n'.encode()
+
+        elif typ == RESPerror.CUSTOM:
+            return f'-ERR {args}\r\n'.encode()
+
+        else:
+            raise RuntimeError('Unknown error type')
+
 store = Store()
 server = Server()
+connections = []
 
 def rdb_contents():
     hex_data = '524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2'
 
     return bytes.fromhex(hex_data)
 
-def process_command(command, args):
+def process_command(command, args, conn: Connection = None):
     global store
     response = None
 
+    # in case command is not in upper-case letters
     command = command.upper()
 
+    print(f'Received command {command}')
+
     if command == 'COMMAND':
-        response = RESP_builder.build(['ping', 'echo'])
+        if not conn: return None
+
+        response = RESPbuilder.build(['ping', 'echo'])
 
     elif command == 'PING':
-        response = RESP_builder.build('PONG', bulkstr=False)
+        if not conn: return None
+
+        argslen = len(args)
+        if argslen > 1:
+            return RESPerror.error(command)
+
+        if argslen == 1:
+            response = RESPbuilder.build(args[0])
+        else:
+            response = RESPbuilder.build('PONG', bulkstr=False)
 
     elif command == 'ECHO':
-        if len(args) == 0:
-            return RESP_builder.error(command)
+        if not conn: return None
 
-        response = RESP_builder.build(args[0])
+        argslen = len(args)
+        if argslen == 0 or argslen > 1:
+            return RESPbuilder.error(command)
+
+        response = RESPbuilder.build(args[0])
 
     elif command == 'INFO':
         subcommand = ''
@@ -261,32 +486,44 @@ def process_command(command, args):
             subcommand = args[0].upper()
             
         if subcommand == 'REPLICATION':
+            if not conn: return None
+
             payload = f'# Replication\r\n'\
                       f'role:{server.role}\r\n'\
                       f'master_replid:{server.master_replid}\r\n'\
                       f'master_repl_offset:{server.master_repl_offset}\r\n'
-            response = RESP_builder.build(payload)
+            response = RESPbuilder.build(payload)
 
         else:
-            response = RESP_builder.error(args='not implemented', typ=RESP_error.CUSTOM)
+            response = RESPbuilder.error(args='not implemented', typ=RESPerror.CUSTOM)
 
     elif command == 'REPLCONF':
+        if not conn: return None
+
         # Hardcode +OK\r\n
-        response = RESP_builder.build('OK', bulkstr=False)
+        response = RESPbuilder.build('OK', bulkstr=False)
 
     elif command == 'PSYNC':
+        if not conn: return None
+
         argslen = len(args)
         if argslen == 1:
-            return RESP_builder.error(command)
+            return RESPbuilder.error(command)
         if argslen == 2 and args[0] != '?' and args[1] != '-1':
-            return RESP_builder.error(typ=RESP_error.SYNTAX)
+            return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+        # set connection as replica
+        conn.set_replica()
+
         # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n and RDB file contents
         # notice formatting
-        response = RESP_builder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESP_builder.build(rdb_contents(), rdb=True)
+        response = RESPbuilder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESPbuilder.build(rdb_contents(), rdb=True)
 
     elif command == 'SET':
         if len(args) < 2:
-            return RESP_builder.error(command)
+            if not conn: return None
+
+            return RESPbuilder.error(command)
 
         exp = -1
         if len(args) > 2:
@@ -294,16 +531,22 @@ def process_command(command, args):
             if expopt == 'PX' and len(args) == 4:
                 exp = int(args[3])
             else:
-                return RESP_builder.error(typ=RESP_error.SYNTAX)
+                if not conn: return None
+
+                return RESPbuilder.error(typ=RESPerror.SYNTAX)
 
         store.set(args[0], args[1], exp)
 
-        response = RESP_builder.build('OK', bulkstr=False)
+        if not conn: return None
+
+        response = RESPbuilder.build('OK', bulkstr=False)
 
     elif command == 'GET':
+        if not conn: return None
+
         nargs = len(args)
         if nargs < 1:
-            return RESP_builder.error(command)
+            return RESPbuilder.error(command)
 
         if nargs == 1:
             values = store.get(args[0])
@@ -314,42 +557,26 @@ def process_command(command, args):
                 value = store.get(args[i])
                 values.append(value)
 
-        response = RESP_builder.build(values)
+        response = RESPbuilder.build(values)
+
+    elif command == 'DEL':
+        if not conn: return None
+
+        nargs = len(args)
+        if nargs < 1:
+            return RESPbuilder.error(command)
+
+        if nargs == 1:
+            keys_deleted = store.delete(args[0])
+
+        else:
+            keys_deleted = 0
+            for i in range(nargs):
+                keys_deleted += store.delete(args[i])
+
+        response = RESPbuilder.build(keys_deleted)
 
     return response
-
-def handle_client(client_socket):
-    with client_socket:
-        while True:
-            request_bytes = client_socket.recv(4096)
-            if not request_bytes:
-                break
-
-            request = request_bytes.decode('utf-8')
-
-            # Parse RESP packet
-            command, *args = RESP_parser.parse(request)
-
-            response = None
-
-            try:
-                response = process_command(command, args)
-
-            except ValueError as v:
-                sys.stderr.write(f'ValueError: {v}\n')
-                response = RESP_builder.error(args='value is not an integer or out of range', typ=RESP_error.CUSTOM) 
-
-            except Exception as e:
-                sys.stderr.write(f'Exception occurred: {e}\n')
-
-            finally:
-                # Default response
-                if response is None or response == '':
-                    response =  RESP_builder.error(
-                        command, args, typ=RESP_error.UNKNOWN_CMD
-                    )
-
-            client_socket.sendall(response)
 
 def check_expiry():
     global store
@@ -369,6 +596,14 @@ def check_expiry():
 
         time.sleep(CHECK_INTERVAL)
 
+def handle_master_conn(socket):
+    while True:
+        data = socket.recv(4096)
+        if data :
+            print(f'Received from master: {data}')
+            command, *args = RESPparser.parse(data.decode('utf-8'))
+            process_command(command, args)
+
 def main():
     global server
 
@@ -384,6 +619,8 @@ def main():
 
     print(f'Running on port: {server.port}')
 
+    master_thread = None
+    master_socket = None
     # Get master host and port
     if args.replicaof:
         server.role = ServerRole.SLAVE
@@ -395,22 +632,26 @@ def main():
 
         master_socket = socket.create_connection((master_host, master_port))
 
-        with master_socket:
-            ping = RESP_builder.build(['ping'])
-            master_socket.sendall(ping)
-            master_socket.recv(4096)
+        ping = RESPbuilder.build(['ping'])
+        master_socket.sendall(ping)
+        master_socket.recv(4096)
 
-            replconf = RESP_builder.build(['REPLCONF', 'listening-port', str(server.port)])
-            master_socket.sendall(replconf)
-            master_socket.recv(4096)
+        replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
+        master_socket.sendall(replconf)
+        master_socket.recv(4096)
 
-            replconf = RESP_builder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
-            master_socket.sendall(replconf)
-            master_socket.recv(4096)
+        replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
+        master_socket.sendall(replconf)
+        master_socket.recv(4096)
 
-            replconf = RESP_builder.build(['PSYNC', '?', '-1'])
-            master_socket.sendall(replconf)
-            master_socket.recv(4096)
+        replconf = RESPbuilder.build(['PSYNC', '?', '-1'])
+        master_socket.sendall(replconf)
+        data = master_socket.recv(4096)
+        rdb = master_socket.recv(4096)
+
+        master_thread = Thread(target=handle_master_conn, args=(master_socket,))
+        master_thread.start()
+
 
     # Start thread to check for key expiry
     expiry_thread = Thread(target=check_expiry)
@@ -425,19 +666,31 @@ def main():
                                          backlog=2,
                                          reuse_port=True)
 
+    relay_thread = Thread(target=server.do_relay)
+    relay_thread.start()
+
     MAX_CONCURRENT_CONN = 5
-    client_threads = []
+    global connections
     num_conn = 0
 
     while num_conn < MAX_CONCURRENT_CONN:
         client_socket, addr = server_socket.accept() # wait for client
+        conn = Connection(client_socket, addr, server)
         print('Incoming connection from', addr)
-        t = Thread(target=handle_client, args=(client_socket,))
-        client_threads.append(t)
-        t.start()
+        t = Thread(target=conn.handle_connection)
+        conn.set_thread(t)
+        connections.append(conn)
+        conn.start()
         num_conn += 1
 
-    for t in client_threads: t.join()
+    for conn in connections: conn.join()
+
+    if master_thread:
+        master_tread.join()
+    if master_socket:
+        master_socket.close()
+
+    relay_thread.join()
 
     expiry_thread.join()
 
