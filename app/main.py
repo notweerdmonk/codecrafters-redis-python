@@ -14,6 +14,74 @@ import secrets
 def millis():
     return int(time.time() * 1000)
 
+class RESPBytes(bytes):
+    def rstrip_all(self, strip_str):
+        """
+        Efficiently strips all occurrences of strip_str from the end of the string
+        and returns the count of occurrences stripped and the resulting bytearray.
+
+        Args:
+        - strip_str: The bytes string to be stripped from the end of the string
+
+        Returns:
+        - The count of occurrences of strip_str stripped from the end of the string
+        - The resulting bytes string after stripping
+        """
+        # Initialize count of occurrences stripped
+        count = 0
+
+        # Calculate the length of strip_str
+        strip_len = len(strip_str)
+
+        # Convert self to a mutable bytearray
+        mutable_bytes = bytearray(self)
+
+        # Iterate over the end of the string, checking if it ends with strip_str
+        while mutable_bytes.endswith(strip_str):
+            # Strip strip_str from the end of the string
+            del mutable_bytes[-strip_len:]
+            # Increment count of occurrences stripped
+            count += 1
+
+        # Convert the mutable bytearray back to bytes
+        result = bytes(mutable_bytes)
+
+        return count, result
+
+
+class RESPStr(str):
+    def rstrip_all(self, strip_str):
+        """
+        Efficiently strips all occurrences of strip_str from the end of the string
+        and returns the count of occurrences stripped.
+        
+        Args:
+        - strip_str: The string to be stripped from the end of the string
+        
+        Returns:
+        - The count of occurrences of strip_str stripped from the end of the string
+        """
+        # Initialize count of occurrences stripped
+        count = 0
+        
+        # Calculate the length of strip_str
+        strip_len = len(strip_str)
+        
+        # Convert self to a mutable string
+        mutable_str = bytearray(self, 'utf-8')
+        
+        # Iterate over the end of the string, checking if it ends with strip_str
+        while mutable_str.endswith(strip_str.encode()):
+            # Strip strip_str from the end of the string
+            del mutable_str[-strip_len:]
+            # Increment count of occurrences stripped
+            count += 1
+        
+        # Convert the mutable string back to a regular string
+        result = mutable_str.decode()
+        
+        return count, result
+
 @dataclass
 class Message(object):
     payload: bytes
@@ -223,33 +291,40 @@ class Connection(object):
                 #request = request_bytes.decode('utf-8')
     
                 # Parse RESP packet
-                command, *args = RESPparser.parse(request_bytes)
+                reqlen = len(request_bytes)
+                at = 0
+                while at < reqlen:
+                    n, tokens = RESPparser.parse(request_bytes[at:])
+                    command, *args = tokens
+                    at += n
 
-                command = command.upper()
-    
-                if command in ['SET', 'DEL']:
-                    self._server.relay(request_bytes, command, args)
+                    #print(f'handle_connection: {n}, {command}, {args}')
 
-                response = None
+                    command = command.upper()
     
-                try:
-                    response = process_command(command, args, self)
+                    if command in ['SET', 'DEL']:
+                        self._server.relay(request_bytes, command, args)
+
+                    response = None
     
-                except ValueError as v:
-                    sys.stderr.write(f'ValueError: {v}\n')
-                    response = RESPbuilder.error(args='value is not an integer or out of range', typ=RESPerror.CUSTOM) 
+                    try:
+                        response = process_command(command, args, self)
     
-                except Exception as e:
-                    sys.stderr.write(f'Exception occurred: {e}\n')
+                    except ValueError as v:
+                        sys.stderr.write(f'ValueError: {v}\n')
+                        response = RESPbuilder.error(args='value is not an integer or out of range', typ=RESPerror.CUSTOM) 
     
-                finally:
-                    # Default response
-                    if response is None or response == '':
-                        response =  RESPbuilder.error(
-                            command, args, typ=RESPerror.UNKNOWN_CMD
-                        )
+                    except Exception as e:
+                        sys.stderr.write(f'Exception occurred: {e}\n')
     
-                self._socket.sendall(response)
+                    finally:
+                        # Default response
+                        if response is None or response == '':
+                            response =  RESPbuilder.error(
+                                command, args, typ=RESPerror.UNKNOWN_CMD
+                            )
+    
+                    self._socket.sendall(response)
 
 class ServerRole(Enum):
     MASTER = 'master'
@@ -315,11 +390,12 @@ class RESPparser(object):
         if len(lines) == 0:
             return ['']
 
-        startline = lines[0].decode()
-        lines.pop(0)
+        #startline = lines[0].decode()
+        #lines.pop(0)
+        n, startline = RESPStr(lines.pop(0).decode()).rstrip_all('\r\n')
+        ntotal = (n * 2) + len(startline)
 
         params = []
-        n = 1
 
         # integer
         if startline.startswith(':'):
@@ -334,13 +410,12 @@ class RESPparser(object):
             nbytes = int(startline[1:])
             if len(lines) < 1:
                 raise RuntimeError('Invalid data')
-            line = lines[0].decode()
+            n, line = RESPStr(lines.pop(0).decode()).rstrip_all('\r\n')
             if len(line) < nbytes:
                 raise RuntimeError('Bulk string data fell short')
+            ntotal += (n * 2) + len(line)
             param = line[:nbytes]
-            lines.pop(0)
-            n += 1
-            return n, param
+            return ntotal, param
 
         # array
         elif startline.startswith('*'):
@@ -350,24 +425,26 @@ class RESPparser(object):
                 nchild, paramschild = cls._parse_internal(lines)
 
                 params.append(paramschild)
-                n += nchild
+                ntotal += nchild
 
-        return n, params
+        return ntotal, params
 
     @classmethod
     def parse(cls, data):
         if len(data) == 0:
             return ['']
 
-        lines = data.splitlines()
+        lines = data.splitlines(keepends=True)
         nlines = len(lines)
 
         n, params = cls._parse_internal(lines)
 
-        if nlines != n:
-            raise RuntimeError('Invalid data')
+        data = data[n:]
 
-        return params
+        #if nlines != n:
+        #    raise RuntimeError('Invalid data')
+
+        return n, params
 
     def __init__(self, data):
         self.params = self.parse(data)
@@ -597,12 +674,36 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 def handle_master_conn(socket):
+    ping = RESPbuilder.build(['ping'])
+    socket.sendall(ping)
+    socket.recv(4096)
+    
+    replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
+    socket.sendall(replconf)
+    socket.recv(4096)
+    
+    replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
+    socket.sendall(replconf)
+    socket.recv(4096)
+    
+    replconf = RESPbuilder.build(['PSYNC', '?', '-1'])
+    socket.sendall(replconf)
+    data = socket.recv(4096)
+    # this is hacky
+    if b'REDIS' not in data:
+        rdb = socket.recv(4096)
+
     while True:
         data = socket.recv(4096)
         if data :
             print(f'Received from master: {data}')
-            command, *args = RESPparser.parse(data.decode('utf-8'))
-            process_command(command, args)
+            datalen = len(data)
+            at = 0
+            while at < datalen:
+                n, tokens = RESPparser.parse(data[at:])
+                command, *args = tokens
+                process_command(command.upper(), args)
+                at += n
 
 def main():
     global server
@@ -632,23 +733,6 @@ def main():
 
         master_socket = socket.create_connection((master_host, master_port))
 
-        ping = RESPbuilder.build(['ping'])
-        master_socket.sendall(ping)
-        master_socket.recv(4096)
-
-        replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
-        master_socket.sendall(replconf)
-        master_socket.recv(4096)
-
-        replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
-        master_socket.sendall(replconf)
-        master_socket.recv(4096)
-
-        replconf = RESPbuilder.build(['PSYNC', '?', '-1'])
-        master_socket.sendall(replconf)
-        data = master_socket.recv(4096)
-        rdb = master_socket.recv(4096)
-
         master_thread = Thread(target=handle_master_conn, args=(master_socket,))
         master_thread.start()
 
@@ -669,7 +753,7 @@ def main():
     relay_thread = Thread(target=server.do_relay)
     relay_thread.start()
 
-    MAX_CONCURRENT_CONN = 5
+    MAX_CONCURRENT_CONN = 10
     global connections
     num_conn = 0
 
