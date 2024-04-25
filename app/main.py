@@ -556,13 +556,13 @@ def process_command(command, args, conn: Connection = None):
         response = RESPbuilder.build(args[0])
 
     elif command == 'INFO':
+        if not conn: return None
+
         subcommand = ''
         if len(args) >= 1:
             subcommand = args[0].upper()
             
         if subcommand == 'REPLICATION':
-            if not conn: return None
-
             payload = f'# Replication\r\n'\
                       f'role:{server.role}\r\n'\
                       f'master_replid:{server.master_replid}\r\n'\
@@ -573,10 +573,24 @@ def process_command(command, args, conn: Connection = None):
             response = RESPbuilder.error(args='not implemented', typ=RESPerror.CUSTOM)
 
     elif command == 'REPLCONF':
-        if not conn: return None
+        #if not conn: return None
 
-        # Hardcode +OK\r\n
-        response = RESPbuilder.build('OK', bulkstr=False)
+        # TODO check if valid connection
+        # (error) ERR 'GETACK' subcommand only valid for REPLCONF listening connections
+
+        subcommand = ''
+        if len(args) >= 1:
+            subcommand = args[0].upper()
+
+        if subcommand == 'GETACK' and args[1] == '*':
+            # Hardcode offset to 0
+            response = RESPbuilder.build(['REPLCONF', 'ACK', '0'])
+
+        else:
+            # Hardcode +OK\r\n
+            response = RESPbuilder.build('OK', bulkstr=False)
+
+        print(f'process_command: response: {response}')
 
     elif command == 'PSYNC':
         if not conn: return None
@@ -674,14 +688,15 @@ def check_expiry():
 def handle_master_conn(socket):
     while True:
         data = socket.recv(4096)
-        if data :
+        if data:
             print(f'Received from master: {data}')
             datalen = len(data)
             at = 0
             while at < datalen:
                 n, tokens = RESPparser.parse(data[at:])
                 command, *args = tokens
-                process_command(command.upper(), args)
+                response = process_command(command.upper(), args)
+                if response: socket.sendall(response)
                 at += n
 
     socket.close()
@@ -741,7 +756,7 @@ def main():
             pattern = r'FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)'
             match = re.match(pattern, token)
             if match and match.start() == 0 and match.end() == len(token):
-                print(f'handle_master_conn: match found!')
+                print('handle_master_conn: match found!')
                 break
             
             ntries += 1
@@ -759,17 +774,18 @@ def main():
             line = data[nparsed:].splitlines(keepends=True)[0]
             n, line = RESPBytes(line).rstrip_all(b'\r\n')
             if not line.startswith(b'$'):
-                print(f'720:Error reading bulk length while SYNCing')
+                print('Error reading bulk length while SYNCing')
                 master_socket.close()
                 return
             try:
                 rdblen = int(line[1:])
             except ValueError as ve:
-                print(f'726:Error reading bulk length while SYNCing')
+                print('Error reading bulk length while SYNCing')
                 master_socket.close()
                 return
             # extract rdb data
-            rdbdata = data[nparsed + (n * 2) + len(line):]
+            rdbdata = data[nparsed + (n * 2) + len(line): nparsed + (n * 2) + len(line) + rdblen]
+            nparsed += (n * 2) + len(line) + rdblen
             rdblen -= len(rdbdata)
 
         # wait for RDB file
@@ -777,27 +793,41 @@ def main():
             if len(rdbdata) == 0:
                 data = master_socket.recv(4096)
                 lines = data.splitlines(keepends=True)[0]
-                n, line = RESPBytes(data).rstrip_all(b'\r\n')
+                n, line = RESPBytes(lines).rstrip_all(b'\r\n')
                 if not line.startswith(b'$'):
-                    print(f'740:Error reading bulk length while SYNCing')
+                    print('Error reading bulk length while SYNCing')
                     master_socket.close()
                     return
                 try:
                     rdblen = int(line[1:])
                 except ValueError as ve:
-                    print(f'746:Error reading bulk length while SYNCing')
+                    print(line)
+                    print('Error reading bulk length while SYNCing')
                     master_socket.close()
                     return
                 # extract rdb data
-                rdbdata = data[n + len(line):]
+                rdbdata = data[(n * 2) + len(line): (n * 2) + len(line) + rdblen]
+                nparsed += (n * 2) + len(line) + rdblen
                 rdblen -= len(rdbdata)
             else:
                 while rdblen > 0:
                     data = master_socket.recv(4096)
                     rdbdata += data
                     rdblen -= len(data)
+                    nparsed += len(data)
                 break
 
+        print(f'Master-slave handshake complete data left: {data[nparsed:]}')
+        if len(data[nparsed:]) > 0:
+            data = data[nparsed:]
+            datalen = len(data)
+            at = 0
+            while at < datalen:
+                n, tokens = RESPparser.parse(data[at:])
+                command, *args = tokens
+                response = process_command(command.upper(), args)
+                if response: master_socket.sendall(response)
+                at += n
 
         #print(f'handle_master_conn: data: {data}')
         ## this is hacky
