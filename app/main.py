@@ -9,7 +9,7 @@ import random
 from dataclasses import dataclass
 import argparse
 import secrets
-#from __future__ import annotations
+import re
 
 def millis():
     return int(time.time() * 1000)
@@ -399,11 +399,11 @@ class RESPparser(object):
 
         # integer
         if startline.startswith(':'):
-            return n, int(startline[1:])
+            return ntotal, int(startline[1:])
 
         # simple string
         elif startline.startswith('+'):
-            return n, startline[1:]
+            return ntotal, startline[1:]
 
         # bulk string
         elif startline.startswith('$'):
@@ -438,8 +438,6 @@ class RESPparser(object):
         nlines = len(lines)
 
         n, params = cls._parse_internal(lines)
-
-        data = data[n:]
 
         #if nlines != n:
         #    raise RuntimeError('Invalid data')
@@ -674,25 +672,6 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 def handle_master_conn(socket):
-    ping = RESPbuilder.build(['ping'])
-    socket.sendall(ping)
-    socket.recv(4096)
-    
-    replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
-    socket.sendall(replconf)
-    socket.recv(4096)
-    
-    replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
-    socket.sendall(replconf)
-    socket.recv(4096)
-    
-    replconf = RESPbuilder.build(['PSYNC', '?', '-1'])
-    socket.sendall(replconf)
-    data = socket.recv(4096)
-    # this is hacky
-    if b'REDIS' not in data:
-        rdb = socket.recv(4096)
-
     while True:
         data = socket.recv(4096)
         if data :
@@ -704,6 +683,8 @@ def handle_master_conn(socket):
                 command, *args = tokens
                 process_command(command.upper(), args)
                 at += n
+
+    socket.close()
 
 def main():
     global server
@@ -733,6 +714,97 @@ def main():
 
         master_socket = socket.create_connection((master_host, master_port))
 
+        ping = RESPbuilder.build(['ping'])
+        master_socket.sendall(ping)
+        master_socket.recv(4096)
+        
+        replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
+        master_socket.sendall(replconf)
+        master_socket.recv(4096)
+        
+        replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
+        master_socket.sendall(replconf)
+        master_socket.recv(4096)
+        
+        psync = RESPbuilder.build(['PSYNC', '?', '-1'])
+
+        nparsed = 0
+        data = b''
+
+        MAX_TRIES = 3
+        ntries = 0
+        while ntries < MAX_TRIES:
+            master_socket.sendall(psync)
+            data = master_socket.recv(4096)
+            n, token = RESPparser.parse(data)
+            nparsed = n
+            pattern = r'FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)'
+            match = re.match(pattern, token)
+            if match and match.start() == 0 and match.end() == len(token):
+                print(f'handle_master_conn: match found!')
+                break
+            
+            ntries += 1
+
+        if ntries == MAX_TRIES:
+            print(f'Error reading replica sync data')
+            master_socket.close()
+            return
+
+        rdblen = 0
+        rdbdata = b''
+
+        # check if any data is left and parse it
+        if nparsed < len(data):
+            line = data[nparsed:].splitlines(keepends=True)[0]
+            n, line = RESPBytes(line).rstrip_all(b'\r\n')
+            if not line.startswith(b'$'):
+                print(f'720:Error reading bulk length while SYNCing')
+                master_socket.close()
+                return
+            try:
+                rdblen = int(line[1:])
+            except ValueError as ve:
+                print(f'726:Error reading bulk length while SYNCing')
+                master_socket.close()
+                return
+            # extract rdb data
+            rdbdata = data[nparsed + (n * 2) + len(line):]
+            rdblen -= len(rdbdata)
+
+        # wait for RDB file
+        while True:
+            if len(rdbdata) == 0:
+                data = master_socket.recv(4096)
+                lines = data.splitlines(keepends=True)[0]
+                n, line = RESPBytes(data).rstrip_all(b'\r\n')
+                if not line.startswith(b'$'):
+                    print(f'740:Error reading bulk length while SYNCing')
+                    master_socket.close()
+                    return
+                try:
+                    rdblen = int(line[1:])
+                except ValueError as ve:
+                    print(f'746:Error reading bulk length while SYNCing')
+                    master_socket.close()
+                    return
+                # extract rdb data
+                rdbdata = data[n + len(line):]
+                rdblen -= len(rdbdata)
+            else:
+                while rdblen > 0:
+                    data = master_socket.recv(4096)
+                    rdbdata += data
+                    rdblen -= len(data)
+                break
+
+
+        #print(f'handle_master_conn: data: {data}')
+        ## this is hacky
+        #if b'REDIS' not in data:
+        #    rdb = master_socket.recv(4096)
+        #    print(f'handle_master_conn: rdb: {rdb}')
+
         master_thread = Thread(target=handle_master_conn, args=(master_socket,))
         master_thread.start()
 
@@ -753,7 +825,7 @@ def main():
     relay_thread = Thread(target=server.do_relay)
     relay_thread.start()
 
-    MAX_CONCURRENT_CONN = 10
+    MAX_CONCURRENT_CONN = 15
     global connections
     num_conn = 0
 
