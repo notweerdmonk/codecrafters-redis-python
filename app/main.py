@@ -522,6 +522,8 @@ def rdb_contents():
 
 def process_command(command, args, conn: Connection = None):
     global store
+    global repl_offset
+
     response = None
 
     # in case command is not in upper-case letters
@@ -584,7 +586,7 @@ def process_command(command, args, conn: Connection = None):
 
         if subcommand == 'GETACK' and args[1] == '*':
             # Hardcode offset to 0
-            response = RESPbuilder.build(['REPLCONF', 'ACK', '0'])
+            response = RESPbuilder.build(['REPLCONF', 'ACK', str(repl_offset)])
 
         else:
             # Hardcode +OK\r\n
@@ -685,11 +687,18 @@ def check_expiry():
 
         time.sleep(CHECK_INTERVAL)
 
+repl_offset = 0
 def handle_master_conn(socket):
-    while True:
-        data = socket.recv(4096)
-        if data:
+    global repl_offset
+
+    print('Starting master conn handler')
+    with socket:
+        while True:
+            data = socket.recv(4096)
             print(f'Received from master: {data}')
+            if not data:
+                break
+
             datalen = len(data)
             at = 0
             while at < datalen:
@@ -697,12 +706,14 @@ def handle_master_conn(socket):
                 command, *args = tokens
                 response = process_command(command.upper(), args)
                 if response: socket.sendall(response)
+                repl_offset += n
                 at += n
 
-    socket.close()
+        print('there')
 
 def main():
     global server
+    global repl_offset
 
     parser = argparse.ArgumentParser(description='Dummy Redis Server')
     parser.add_argument('--port', type=int, help='Port number')
@@ -756,7 +767,7 @@ def main():
             pattern = r'FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)'
             match = re.match(pattern, token)
             if match and match.start() == 0 and match.end() == len(token):
-                print('handle_master_conn: match found!')
+                #print(f'handle_master_conn: match found token: {token}')
                 break
             
             ntries += 1
@@ -817,7 +828,10 @@ def main():
                     nparsed += len(data)
                 break
 
-        print(f'Master-slave handshake complete data left: {data[nparsed:]}')
+        #print(f'handle_master_conn: rdb: {rdbdata}')
+        #print(f'Master-slave handshake complete data left: {data[nparsed:]}')
+        print('Master-slave handshake complete')
+
         if len(data[nparsed:]) > 0:
             data = data[nparsed:]
             datalen = len(data)
@@ -827,6 +841,7 @@ def main():
                 command, *args = tokens
                 response = process_command(command.upper(), args)
                 if response: master_socket.sendall(response)
+                repl_offset += n
                 at += n
 
         #print(f'handle_master_conn: data: {data}')
@@ -872,7 +887,7 @@ def main():
     for conn in connections: conn.join()
 
     if master_thread:
-        master_tread.join()
+        master_thread.join()
     if master_socket:
         master_socket.close()
 
