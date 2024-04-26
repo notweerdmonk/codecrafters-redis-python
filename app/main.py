@@ -610,6 +610,19 @@ def process_command(command, args, conn: Connection = None):
         # notice formatting
         response = RESPbuilder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESPbuilder.build(rdb_contents(), rdb=True)
 
+    elif command == 'WAIT':
+        if not conn: return None
+
+        argslen = len(args)
+        if argslen < 2:
+            return RESPbuilder.error(command)
+
+        numreplicas = int(args[0])
+        timeout = int(args[1])
+
+        # Hardcode response
+        response = RESPbuilder.build(0)
+        
     elif command == 'SET':
         if len(args) < 2:
             if not conn: return None
@@ -705,11 +718,9 @@ def handle_master_conn(socket):
                 n, tokens = RESPparser.parse(data[at:])
                 command, *args = tokens
                 response = process_command(command.upper(), args)
-                if response: socket.sendall(response)
+                if response and len(response) > 0: socket.sendall(response)
                 repl_offset += n
                 at += n
-
-        print('there')
 
 def main():
     global server
@@ -796,7 +807,7 @@ def main():
                 return
             # extract rdb data
             rdbdata = data[nparsed + (n * 2) + len(line): nparsed + (n * 2) + len(line) + rdblen]
-            nparsed += (n * 2) + len(line) + rdblen
+            nparsed += (n * 2) + len(line) + len(rdbdata)
             rdblen -= len(rdbdata)
 
         # wait for RDB file
@@ -818,7 +829,7 @@ def main():
                     return
                 # extract rdb data
                 rdbdata = data[(n * 2) + len(line): (n * 2) + len(line) + rdblen]
-                nparsed += (n * 2) + len(line) + rdblen
+                nparsed += (n * 2) + len(line) + len(rdbdata)
                 rdblen -= len(rdbdata)
             else:
                 while rdblen > 0:
@@ -840,7 +851,7 @@ def main():
                 n, tokens = RESPparser.parse(data[at:])
                 command, *args = tokens
                 response = process_command(command.upper(), args)
-                if response: master_socket.sendall(response)
+                if response and len(response) > 0: master_socket.sendall(response)
                 repl_offset += n
                 at += n
 
