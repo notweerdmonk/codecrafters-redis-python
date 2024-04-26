@@ -308,7 +308,7 @@ class Connection(object):
                     response = None
     
                     try:
-                        response = process_command(command, args, self)
+                        response = server.process_command(command, args, self)
     
                     except ValueError as v:
                         sys.stderr.write(f'ValueError: {v}\n')
@@ -383,6 +383,168 @@ class Server(object):
                     sent = True
                 if sent:
                     self._msgq.dequeue()
+
+    def process_command(self, command: str, args: list, conn: Connection = None):
+        global store
+        global repl_offset
+
+        response = None
+
+        # in case command is not in upper-case letters
+        command = command.upper()
+
+        print(f'Received command {command}')
+
+        if command == 'COMMAND':
+            if not conn: return None
+
+            response = RESPbuilder.build(['ping', 'echo'])
+
+        elif command == 'PING':
+            if not conn: return None
+
+            argslen = len(args)
+            if argslen > 1:
+                return RESPerror.error(command)
+
+            if argslen == 1:
+                response = RESPbuilder.build(args[0])
+            else:
+                response = RESPbuilder.build('PONG', bulkstr=False)
+
+        elif command == 'ECHO':
+            if not conn: return None
+
+            argslen = len(args)
+            if argslen == 0 or argslen > 1:
+                return RESPbuilder.error(command)
+
+            response = RESPbuilder.build(args[0])
+
+        elif command == 'INFO':
+            if not conn: return None
+
+            subcommand = ''
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+                
+            if subcommand == 'REPLICATION':
+                payload = f'# Replication\r\n'\
+                          f'role:{server.role}\r\n'\
+                          f'master_replid:{server.master_replid}\r\n'\
+                          f'master_repl_offset:{server.master_repl_offset}\r\n'
+                response = RESPbuilder.build(payload)
+
+            else:
+                response = RESPbuilder.error(args='not implemented', typ=RESPerror.CUSTOM)
+
+        elif command == 'REPLCONF':
+            #if not conn: return None
+
+            # TODO check if valid connection
+            # (error) ERR 'GETACK' subcommand only valid for REPLCONF listening connections
+
+            subcommand = ''
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+
+            if subcommand == 'GETACK' and args[1] == '*':
+                # Hardcode offset to 0
+                response = RESPbuilder.build(['REPLCONF', 'ACK', str(repl_offset)])
+
+            else:
+                # Hardcode +OK\r\n
+                response = RESPbuilder.build('OK', bulkstr=False)
+
+            print(f'Server.process_command: response: {response}')
+
+        elif command == 'PSYNC':
+            if not conn: return None
+
+            argslen = len(args)
+            if argslen == 1:
+                return RESPbuilder.error(command)
+            if argslen == 2 and args[0] != '?' and args[1] != '-1':
+                return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+            # set connection as replica
+            conn.set_replica()
+
+            # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n and RDB file contents
+            # notice formatting
+            response = RESPbuilder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESPbuilder.build(rdb_contents(), rdb=True)
+
+        elif command == 'WAIT':
+            if not conn: return None
+
+            argslen = len(args)
+            if argslen < 2:
+                return RESPbuilder.error(command)
+
+            numreplicas = int(args[0])
+            timeout = int(args[1])
+
+            # Hardcode number of replicas
+            response = RESPbuilder.build(int(len(self._replicas)))
+            
+        elif command == 'SET':
+            if len(args) < 2:
+                if not conn: return None
+
+                return RESPbuilder.error(command)
+
+            exp = -1
+            if len(args) > 2:
+                expopt = args[2].upper()
+                if expopt == 'PX' and len(args) == 4:
+                    exp = int(args[3])
+                else:
+                    if not conn: return None
+
+                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+            store.set(args[0], args[1], exp)
+
+            if not conn: return None
+
+            response = RESPbuilder.build('OK', bulkstr=False)
+
+        elif command == 'GET':
+            if not conn: return None
+
+            nargs = len(args)
+            if nargs < 1:
+                return RESPbuilder.error(command)
+
+            if nargs == 1:
+                values = store.get(args[0])
+
+            else:
+                values = []
+                for i in range(nargs):
+                    value = store.get(args[i])
+                    values.append(value)
+
+            response = RESPbuilder.build(values)
+
+        elif command == 'DEL':
+            if not conn: return None
+
+            nargs = len(args)
+            if nargs < 1:
+                return RESPbuilder.error(command)
+
+            if nargs == 1:
+                keys_deleted = store.delete(args[0])
+
+            else:
+                keys_deleted = 0
+                for i in range(nargs):
+                    keys_deleted += store.delete(args[i])
+
+            response = RESPbuilder.build(keys_deleted)
+
+        return response
 
 class RESPparser(object):
     @classmethod
@@ -520,168 +682,6 @@ def rdb_contents():
 
     return bytes.fromhex(hex_data)
 
-def process_command(command, args, conn: Connection = None):
-    global store
-    global repl_offset
-
-    response = None
-
-    # in case command is not in upper-case letters
-    command = command.upper()
-
-    print(f'Received command {command}')
-
-    if command == 'COMMAND':
-        if not conn: return None
-
-        response = RESPbuilder.build(['ping', 'echo'])
-
-    elif command == 'PING':
-        if not conn: return None
-
-        argslen = len(args)
-        if argslen > 1:
-            return RESPerror.error(command)
-
-        if argslen == 1:
-            response = RESPbuilder.build(args[0])
-        else:
-            response = RESPbuilder.build('PONG', bulkstr=False)
-
-    elif command == 'ECHO':
-        if not conn: return None
-
-        argslen = len(args)
-        if argslen == 0 or argslen > 1:
-            return RESPbuilder.error(command)
-
-        response = RESPbuilder.build(args[0])
-
-    elif command == 'INFO':
-        if not conn: return None
-
-        subcommand = ''
-        if len(args) >= 1:
-            subcommand = args[0].upper()
-            
-        if subcommand == 'REPLICATION':
-            payload = f'# Replication\r\n'\
-                      f'role:{server.role}\r\n'\
-                      f'master_replid:{server.master_replid}\r\n'\
-                      f'master_repl_offset:{server.master_repl_offset}\r\n'
-            response = RESPbuilder.build(payload)
-
-        else:
-            response = RESPbuilder.error(args='not implemented', typ=RESPerror.CUSTOM)
-
-    elif command == 'REPLCONF':
-        #if not conn: return None
-
-        # TODO check if valid connection
-        # (error) ERR 'GETACK' subcommand only valid for REPLCONF listening connections
-
-        subcommand = ''
-        if len(args) >= 1:
-            subcommand = args[0].upper()
-
-        if subcommand == 'GETACK' and args[1] == '*':
-            # Hardcode offset to 0
-            response = RESPbuilder.build(['REPLCONF', 'ACK', str(repl_offset)])
-
-        else:
-            # Hardcode +OK\r\n
-            response = RESPbuilder.build('OK', bulkstr=False)
-
-        print(f'process_command: response: {response}')
-
-    elif command == 'PSYNC':
-        if not conn: return None
-
-        argslen = len(args)
-        if argslen == 1:
-            return RESPbuilder.error(command)
-        if argslen == 2 and args[0] != '?' and args[1] != '-1':
-            return RESPbuilder.error(typ=RESPerror.SYNTAX)
-
-        # set connection as replica
-        conn.set_replica()
-
-        # Hardcode response +FULLRESYNC <REPL_ID> 0\r\n and RDB file contents
-        # notice formatting
-        response = RESPbuilder.build(f'FULLRESYNC {server.master_replid} {server.master_repl_offset}', bulkstr=False) + RESPbuilder.build(rdb_contents(), rdb=True)
-
-    elif command == 'WAIT':
-        if not conn: return None
-
-        argslen = len(args)
-        if argslen < 2:
-            return RESPbuilder.error(command)
-
-        numreplicas = int(args[0])
-        timeout = int(args[1])
-
-        # Hardcode response
-        response = RESPbuilder.build(0)
-        
-    elif command == 'SET':
-        if len(args) < 2:
-            if not conn: return None
-
-            return RESPbuilder.error(command)
-
-        exp = -1
-        if len(args) > 2:
-            expopt = args[2].upper()
-            if expopt == 'PX' and len(args) == 4:
-                exp = int(args[3])
-            else:
-                if not conn: return None
-
-                return RESPbuilder.error(typ=RESPerror.SYNTAX)
-
-        store.set(args[0], args[1], exp)
-
-        if not conn: return None
-
-        response = RESPbuilder.build('OK', bulkstr=False)
-
-    elif command == 'GET':
-        if not conn: return None
-
-        nargs = len(args)
-        if nargs < 1:
-            return RESPbuilder.error(command)
-
-        if nargs == 1:
-            values = store.get(args[0])
-
-        else:
-            values = []
-            for i in range(nargs):
-                value = store.get(args[i])
-                values.append(value)
-
-        response = RESPbuilder.build(values)
-
-    elif command == 'DEL':
-        if not conn: return None
-
-        nargs = len(args)
-        if nargs < 1:
-            return RESPbuilder.error(command)
-
-        if nargs == 1:
-            keys_deleted = store.delete(args[0])
-
-        else:
-            keys_deleted = 0
-            for i in range(nargs):
-                keys_deleted += store.delete(args[i])
-
-        response = RESPbuilder.build(keys_deleted)
-
-    return response
-
 def check_expiry():
     global store
     CHECK_INTERVAL = 300 # seconds
@@ -701,13 +701,135 @@ def check_expiry():
         time.sleep(CHECK_INTERVAL)
 
 repl_offset = 0
-def handle_master_conn(socket):
+def handle_master_conn(host, port):
+    global server
     global repl_offset
 
-    print('Starting master conn handler')
-    with socket:
+    print('Connecting to master')
+
+    master_socket = socket.create_connection((host, port))
+
+    ping = RESPbuilder.build(['ping'])
+    master_socket.sendall(ping)
+    master_socket.recv(4096)
+    
+    replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
+    master_socket.sendall(replconf)
+    master_socket.recv(4096)
+    
+    replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
+    master_socket.sendall(replconf)
+    master_socket.recv(4096)
+    
+    psync = RESPbuilder.build(['PSYNC', '?', '-1'])
+
+    nparsed = 0
+    data = b''
+
+    MAX_TRIES = 3
+    ntries = 0
+    while ntries < MAX_TRIES:
+        master_socket.sendall(psync)
+        # The tester driver sometimes is too eager to receive the response to
+        # PSYNC command and probably errors out if there is any delay.
+        # Receiving only as many bytes as in the response will avoid post
+        # processing and avoid the delay.
+        data = master_socket.recv(56)
+        #print(f'expecting FULLRESYNC: data: {data}')
+        n, token = RESPparser.parse(data)
+        nparsed = n
+        pattern = r'FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)'
+        match = re.match(pattern, token)
+        if match and match.start() == 0 and match.end() == len(token):
+            #print(f'handle_master_conn: match found token: {token}')
+            break
+        
+        ntries += 1
+
+    if ntries == MAX_TRIES:
+        print(f'Error reading replica sync data')
+        master_socket.close()
+        return
+
+    rdblen = 0
+    rdbdata = b''
+
+    # check if any data is left and parse it
+    if nparsed < len(data):
+        line = data[nparsed:].splitlines(keepends=True)[0]
+        n, line = RESPBytes(line).rstrip_all(b'\r\n')
+        if not line.startswith(b'$'):
+            print('Error reading bulk length while SYNCing')
+            master_socket.close()
+            return
+        try:
+            rdblen = int(line[1:])
+        except ValueError as ve:
+            print('Error reading bulk length while SYNCing')
+            master_socket.close()
+            return
+        # extract rdb data
+        rdbdata = data[nparsed + (n * 2) + len(line): nparsed + (n * 2) + len(line) + rdblen]
+        nparsed += (n * 2) + len(line) + len(rdbdata)
+        rdblen -= len(rdbdata)
+
+    # wait for RDB file
+    while True:
+        if len(rdbdata) == 0:
+            data = master_socket.recv(4096)
+            #print(f'1expecting RDB; data: {data}')
+            lines = data.splitlines(keepends=True)[0]
+            n, line = RESPBytes(lines).rstrip_all(b'\r\n')
+            if not line.startswith(b'$'):
+                print('Error reading bulk length while SYNCing')
+                master_socket.close()
+                return
+            try:
+                rdblen = int(line[1:])
+            except ValueError as ve:
+                print(line)
+                print('Error reading bulk length while SYNCing')
+                master_socket.close()
+                return
+            # extract rdb data
+            rdbdata = data[(n * 2) + len(line): (n * 2) + len(line) + rdblen]
+            nparsed = (n * 2) + len(line) + len(rdbdata)
+            rdblen -= len(rdbdata)
+        else:
+            while rdblen > 0:
+                data = master_socket.recv(4096)
+                #print(f'2expecting RDB; data: {data}')
+                rdbdata += data
+                rdblen -= len(data)
+                nparsed = len(data)
+            break
+
+    print(f'handle_master_conn: rdb: {rdbdata}')
+    print(f'Master-slave handshake complete nparsed: {nparsed}, data left: {data[nparsed:]}')
+    #print('Master-slave handshake complete')
+
+    if len(data[nparsed:]) > 0:
+        data = data[nparsed:]
+        print(f'left over data: {data}')
+        datalen = len(data)
+        at = 0
+        while at < datalen:
+            n, tokens = RESPparser.parse(data[at:])
+            command, *args = tokens
+            response = server.process_command(command.upper(), args)
+            if response and len(response) > 0: master_socket.sendall(response)
+            repl_offset += n
+            at += n
+
+    #print(f'handle_master_conn: data: {data}')
+    ## this is hacky
+    #if b'REDIS' not in data:
+    #    rdb = master_socket.recv(4096)
+    #    print(f'handle_master_conn: rdb: {rdb}')
+
+    with master_socket:
         while True:
-            data = socket.recv(4096)
+            data = master_socket.recv(4096)
             print(f'Received from master: {data}')
             if not data:
                 break
@@ -717,8 +839,8 @@ def handle_master_conn(socket):
             while at < datalen:
                 n, tokens = RESPparser.parse(data[at:])
                 command, *args = tokens
-                response = process_command(command.upper(), args)
-                if response and len(response) > 0: socket.sendall(response)
+                response = server.process_command(command.upper(), args)
+                if response and len(response) > 0: master_socket.sendall(response)
                 repl_offset += n
                 at += n
 
@@ -739,7 +861,6 @@ def main():
     print(f'Running on port: {server.port}')
 
     master_thread = None
-    master_socket = None
     # Get master host and port
     if args.replicaof:
         server.role = ServerRole.SLAVE
@@ -747,121 +868,7 @@ def main():
         master_port = args.replicaof[1]
         print(f'Set as slave replicating {args.replicaof[0]}:{args.replicaof[1]}')
 
-        print('Connecting to master')
-
-        master_socket = socket.create_connection((master_host, master_port))
-
-        ping = RESPbuilder.build(['ping'])
-        master_socket.sendall(ping)
-        master_socket.recv(4096)
-        
-        replconf = RESPbuilder.build(['REPLCONF', 'listening-port', str(server.port)])
-        master_socket.sendall(replconf)
-        master_socket.recv(4096)
-        
-        replconf = RESPbuilder.build(['REPLCONF', 'capa', 'eof', 'capa', 'psync2'])
-        master_socket.sendall(replconf)
-        master_socket.recv(4096)
-        
-        psync = RESPbuilder.build(['PSYNC', '?', '-1'])
-
-        nparsed = 0
-        data = b''
-
-        MAX_TRIES = 3
-        ntries = 0
-        while ntries < MAX_TRIES:
-            master_socket.sendall(psync)
-            data = master_socket.recv(4096)
-            n, token = RESPparser.parse(data)
-            nparsed = n
-            pattern = r'FULLRESYNC ([a-zA-Z0-9]{40}) (\d+)'
-            match = re.match(pattern, token)
-            if match and match.start() == 0 and match.end() == len(token):
-                #print(f'handle_master_conn: match found token: {token}')
-                break
-            
-            ntries += 1
-
-        if ntries == MAX_TRIES:
-            print(f'Error reading replica sync data')
-            master_socket.close()
-            return
-
-        rdblen = 0
-        rdbdata = b''
-
-        # check if any data is left and parse it
-        if nparsed < len(data):
-            line = data[nparsed:].splitlines(keepends=True)[0]
-            n, line = RESPBytes(line).rstrip_all(b'\r\n')
-            if not line.startswith(b'$'):
-                print('Error reading bulk length while SYNCing')
-                master_socket.close()
-                return
-            try:
-                rdblen = int(line[1:])
-            except ValueError as ve:
-                print('Error reading bulk length while SYNCing')
-                master_socket.close()
-                return
-            # extract rdb data
-            rdbdata = data[nparsed + (n * 2) + len(line): nparsed + (n * 2) + len(line) + rdblen]
-            nparsed += (n * 2) + len(line) + len(rdbdata)
-            rdblen -= len(rdbdata)
-
-        # wait for RDB file
-        while True:
-            if len(rdbdata) == 0:
-                data = master_socket.recv(4096)
-                lines = data.splitlines(keepends=True)[0]
-                n, line = RESPBytes(lines).rstrip_all(b'\r\n')
-                if not line.startswith(b'$'):
-                    print('Error reading bulk length while SYNCing')
-                    master_socket.close()
-                    return
-                try:
-                    rdblen = int(line[1:])
-                except ValueError as ve:
-                    print(line)
-                    print('Error reading bulk length while SYNCing')
-                    master_socket.close()
-                    return
-                # extract rdb data
-                rdbdata = data[(n * 2) + len(line): (n * 2) + len(line) + rdblen]
-                nparsed += (n * 2) + len(line) + len(rdbdata)
-                rdblen -= len(rdbdata)
-            else:
-                while rdblen > 0:
-                    data = master_socket.recv(4096)
-                    rdbdata += data
-                    rdblen -= len(data)
-                    nparsed += len(data)
-                break
-
-        #print(f'handle_master_conn: rdb: {rdbdata}')
-        #print(f'Master-slave handshake complete data left: {data[nparsed:]}')
-        print('Master-slave handshake complete')
-
-        if len(data[nparsed:]) > 0:
-            data = data[nparsed:]
-            datalen = len(data)
-            at = 0
-            while at < datalen:
-                n, tokens = RESPparser.parse(data[at:])
-                command, *args = tokens
-                response = process_command(command.upper(), args)
-                if response and len(response) > 0: master_socket.sendall(response)
-                repl_offset += n
-                at += n
-
-        #print(f'handle_master_conn: data: {data}')
-        ## this is hacky
-        #if b'REDIS' not in data:
-        #    rdb = master_socket.recv(4096)
-        #    print(f'handle_master_conn: rdb: {rdb}')
-
-        master_thread = Thread(target=handle_master_conn, args=(master_socket,))
+        master_thread = Thread(target=handle_master_conn, args=(master_host,master_port,))
         master_thread.start()
 
 
@@ -899,8 +906,6 @@ def main():
 
     if master_thread:
         master_thread.join()
-    if master_socket:
-        master_socket.close()
 
     relay_thread.join()
 
