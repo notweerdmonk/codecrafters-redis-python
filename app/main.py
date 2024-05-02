@@ -2,7 +2,7 @@
 import sys
 import socket
 from threading import Thread, Lock, Event
-from typing import Union
+from typing import Union, Any
 from enum import Enum
 import time
 import random
@@ -246,12 +246,33 @@ class ServerRole(Enum):
     MASTER = "master"
     SLAVE = "slave"
 
+@dataclass
+class ConfigObject(object):
+    name: str = ''
+    value: Any = ''
+
+    def build(self):
+        return [self.name, str(self.value)]
+
+class ServerConfig(object):
+    dirpath: ConfigObject = ConfigObject(name="dir")
+    dbfilename: ConfigObject = ConfigObject(name="dbfilename")
+
+    def __init__(self, dirpath: str, dbfilename: str):
+        self.dirpath.value = dirpath
+        self.dbfilename.value = dbfilename
+
+    def build(self):
+        return self.dirpath.build() + self.dbfilename.build()
+
+    def __repr__(self):
+        return f"ServerConfig(dirpath={self.dirpath}, dbfilename={self.dbfilename})"
 
 class Server(object):
     _instance = None
     PROPAGATED_COMMANDS = ["SET", "DEL"]
 
-    def __init__(self, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+    def __init__(self, config: ServerConfig, port: int = 6379, role: ServerRole = ServerRole.MASTER):
         self._host = "localhost"
         self._port = port
         self._role = role
@@ -260,6 +281,8 @@ class Server(object):
 
         self.master_replid = secrets.token_hex(20)
         self.master_repl_offset = 0
+
+        self.config = config
 
     def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
         if cls._instance is None:
@@ -351,6 +374,30 @@ class Server(object):
                 response = RESPbuilder.error(
                     args="not implemented", typ=RESPerror.CUSTOM
                 )
+
+        elif command == "CONFIG":
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0].upper()
+
+            if subcommand == "GET":
+                opts = args[1:]
+
+                payload = []
+
+                if len(opts) == 0:
+                    payload = self.config.build()
+
+                else:
+                    for o in opts:
+                        opt = o.lower()
+                        if opt == "dir":
+                            payload += self.config.dirpath.build()
+    
+                        elif opt == "dbfilename":
+                            payload += self.config.dbfilename.build()
+    
+                response = RESPbuilder.build(payload)
 
         elif command == "REPLCONF":
             subcommand = ""
@@ -511,7 +558,7 @@ class RESPparser(object):
     @classmethod
     def _parse_internal(cls, lines):
         if len(lines) == 0:
-            return [""]
+            return 0, [""]
 
         n, startline = RESPStr(lines.pop(0).decode()).rstrip_all("\r\n")
         ntotal = (n * 2) + len(startline)
@@ -553,7 +600,7 @@ class RESPparser(object):
     @classmethod
     def parse(cls, data):
         if len(data) == 0:
-            return [""]
+            return 0, [""]
 
         lines = data.splitlines(keepends=True)
         nlines = len(lines)
@@ -639,11 +686,6 @@ class RESPbuilder(object):
             raise RuntimeError("Unknown error type")
 
 
-store = Store()
-server = Server()
-connections = []
-
-
 def rdb_contents():
     hex_data = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
 
@@ -666,9 +708,6 @@ def check_expiry():
                 store.expired(key)
 
         time.sleep(CHECK_INTERVAL)
-
-
-repl_offset = 0
 
 
 def handle_master_conn(host, port):
@@ -804,6 +843,12 @@ def handle_master_conn(host, port):
                 repl_offset += n
                 at += n
 
+# Globals
+store = Store()
+server = None
+repl_offset = 0
+connections = []
+
 
 def main():
     global server
@@ -817,12 +862,38 @@ def main():
         metavar=("host", "port"),
         help="Set the host and port of the master to replicate",
     )
+    parser.add_argument(
+        "--dir",
+        type=str,
+        help="Path to directory where RDB file gets stored"
+    )
+    parser.add_argument(
+        "--dbfilename",
+        type=str,
+        help="Name of the RDB file"
+    )
 
     args = parser.parse_args()
 
+    # Configuration
+    dirpath = "/tmp/redis-data"
+    if args.dir:
+        dirpath = args.dir
+
+    dbfilename = "rdbfile"
+    if args.dbfilename:
+        dbfilename = args.dbfilename
+
+    config = ServerConfig(
+        dirpath=dirpath, dbfilename=dbfilename
+    )
+
     # Get port number
+    port = 6379
     if args.port:
-        server.port = args.port
+        port = args.port
+
+    server = Server(config, port)
 
     print(f"Running on port: {server.port}")
 
