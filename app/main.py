@@ -129,10 +129,12 @@ class Store(object):
             return list(self._store.keys())
 
 
-    def set(self, key, value, expiry=-1):
+    def set(self, key, value, expiry=-1, absolute=False):
         with self._lock:
+            expiry = (expiry if absolute == True else millis() + expiry) if expiry != -1 else expiry
+            print(f"key {key}, expriy {expiry}, millis() {millis()}")
             self._store[key] = StoreElement(
-                value, (millis() + expiry) if expiry != -1 else expiry
+                value, expiry
             )
 
     def get(self, key):
@@ -141,6 +143,7 @@ class Store(object):
                 return ""
 
             e = self._store[key]
+            print(f"key {key}: {e}, millis() {millis()}")
             if e.expiry > 0 and e.expiry <= millis():
                 self._store.pop(key)
                 return ""
@@ -294,8 +297,9 @@ class Server(object):
             rdbdata = rdb_contents()
 
         for state, key, value, expiry in parser.parse(rdbdata):
-            if state[:7] == "key_val":
-                store.set(key, value, expiry)
+            print(state, key, value, expiry)
+            if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
+                store.set(key, value, expiry, absolute=True)
 
 
     def __init__(self, config: ServerConfig, port: int = 6379, role: ServerRole = ServerRole.MASTER):
@@ -829,13 +833,13 @@ class RDBparser(object):
             if opcode == 0xFD:  # Expiry time in seconds
                 self._state = "key_val_s"
 
-                expiry = int.from_bytes(data[pos:pos+4], byteorder='little', signed=False)
+                expiry = int.from_bytes(stream[pos:pos+4], byteorder='little', signed=False)
                 pos += 4
 
             elif opcode == 0xFC:  # Expiry time in milliseconds
                 self._state = "key_val_ms"
 
-                expiry = int.from_bytes(data[pos:pos+8], byteorder='little', signed=False) // 1000
+                expiry = int.from_bytes(stream[pos:pos+8], byteorder='little', signed=False)
                 pos += 8
 
             elif opcode == 0xFA: # Auxiliary fields
