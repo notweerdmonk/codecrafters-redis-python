@@ -129,10 +129,8 @@ class Store(object):
             return list(self._store.keys())
 
 
-    def set(self, key, value, expiry=-1, absolute=False):
+    def set(self, key, value, expiry=-1):
         with self._lock:
-            expiry = (expiry if absolute == True else millis() + expiry) if expiry != -1 else expiry
-            print(f"key {key}, expriy {expiry}, millis() {millis()}")
             self._store[key] = StoreElement(
                 value, expiry
             )
@@ -143,7 +141,6 @@ class Store(object):
                 return ""
 
             e = self._store[key]
-            print(f"key {key}: {e}, millis() {millis()}")
             if e.expiry > 0 and e.expiry <= millis():
                 self._store.pop(key)
                 return ""
@@ -297,9 +294,8 @@ class Server(object):
             rdbdata = rdb_contents()
 
         for state, key, value, expiry in parser.parse(rdbdata):
-            print(state, key, value, expiry)
             if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
-                store.set(key, value, expiry, absolute=True)
+                store.set(key, value, expiry)
 
 
     def __init__(self, config: ServerConfig, port: int = 6379, role: ServerRole = ServerRole.MASTER):
@@ -530,6 +526,18 @@ class Server(object):
                 keys = list(store.keys())
                 response = RESPbuilder.build(keys)
 
+        elif command == "TYPE":
+            key = ""
+            if len(args) >= 1:
+                key = args[0]
+
+            value = store.get(key)
+
+            if len(value) > 0:
+                response = RESPbuilder.build("string", bulkstr=False)
+            else:
+                response = RESPbuilder.build("none", bulkstr=False)
+
         elif command == "SET":
             if len(args) < 2:
                 if not conn:
@@ -537,18 +545,18 @@ class Server(object):
 
                 return RESPbuilder.error(command)
 
-            exp = -1
+            expiry = -1
             if len(args) > 2:
                 expopt = args[2].upper()
                 if expopt == "PX" and len(args) == 4:
-                    exp = int(args[3])
+                    expiry = millis() + int(args[3])
                 else:
                     if not conn:
                         return None
 
                     return RESPbuilder.error(typ=RESPerror.SYNTAX)
 
-            store.set(args[0], args[1], exp)
+            store.set(args[0], args[1], expiry)
 
             if not conn:
                 return None
