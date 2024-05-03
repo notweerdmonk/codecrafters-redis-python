@@ -10,6 +10,9 @@ from dataclasses import dataclass
 import argparse
 import secrets
 import re
+import struct
+#import fastcrc
+#import crc
 
 
 def millis():
@@ -123,7 +126,8 @@ class Store(object):
 
     def keys(self):
         with self._lock:
-            return self._store.keys()
+            return list(self._store.keys())
+
 
     def set(self, key, value, expiry=-1):
         with self._lock:
@@ -248,8 +252,8 @@ class ServerRole(Enum):
 
 @dataclass
 class ConfigObject(object):
-    name: str = ''
-    value: Any = ''
+    name: str = ""
+    value: Any = None
 
     def build(self):
         return [self.name, str(self.value)]
@@ -257,20 +261,42 @@ class ConfigObject(object):
 class ServerConfig(object):
     dirpath: ConfigObject = ConfigObject(name="dir")
     dbfilename: ConfigObject = ConfigObject(name="dbfilename")
+    rdbchecksum: ConfigObject = ConfigObject(name="rdbchecksum")
 
-    def __init__(self, dirpath: str, dbfilename: str):
-        self.dirpath.value = dirpath
-        self.dbfilename.value = dbfilename
+    def __init__(self, rdbchecksum: bool = True, **kwargs):
+        self.rdbchecksum.value = rdbchecksum
+        self.dirpath.value = kwargs.get("dirpath", "")
+        self.dbfilename.value = kwargs.get("dbfilename", "")
 
     def build(self):
         return self.dirpath.build() + self.dbfilename.build()
 
     def __repr__(self):
-        return f"ServerConfig(dirpath={self.dirpath}, dbfilename={self.dbfilename})"
+        return f"ServerConfig(rdbchecksum={self.rdbchecksum}, dirpath={self.dirpath}, dbfilename={self.dbfilename})"
 
 class Server(object):
     _instance = None
     PROPAGATED_COMMANDS = ["SET", "DEL"]
+
+    def read_rdb(self):
+        global store
+
+        rdbdata = b""
+        rdbpath = self.config.dirpath.value + "/" + self.config.dbfilename.value
+
+        parser = RDBparser()
+        try:
+            with open(rdbpath, "rb") as f:
+                rdbdata = f.read()
+
+        except FileNotFoundError as e:
+            print(f"RDB file {rdbpath} not found")
+            rdbdata = rdb_contents()
+
+        for state, key, value, expiry in parser.parse(rdbdata):
+            if state[:7] == "key_val":
+                store.set(key, value, expiry)
+
 
     def __init__(self, config: ServerConfig, port: int = 6379, role: ServerRole = ServerRole.MASTER):
         self._host = "localhost"
@@ -283,6 +309,8 @@ class Server(object):
         self.master_repl_offset = 0
 
         self.config = config
+
+        self.read_rdb()
 
     def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
         if cls._instance is None:
@@ -489,6 +517,15 @@ class Server(object):
 
             response = RESPbuilder.build(int(result))
 
+        elif command == "KEYS":
+            subcommand = ""
+            if len(args) >= 1:
+                subcommand = args[0]
+
+            if subcommand == "*":
+                keys = list(store.keys())
+                response = RESPbuilder.build(keys)
+
         elif command == "SET":
             if len(args) < 2:
                 if not conn:
@@ -685,6 +722,195 @@ class RESPbuilder(object):
         else:
             raise RuntimeError("Unknown error type")
 
+class RDBparser(object):
+    _states = [
+        "start",
+        "magic",
+        "ver",
+        "aux",
+        "db_sel",
+        "key_val_s",
+        "key_val_ms",
+        "key_val",
+        "eof",
+        "chksum"
+    ]
+
+    _datatypes = [
+        "str",
+        "int8",
+        "int16",
+        "int32",
+        "lzf"
+    ]
+
+    def __init__(self, rdbchecksum: bool = True):
+        self._state = RDBparser._states[0]
+        self._rdbchecksum = rdbchecksum
+
+
+    def decode_length_encoding(self, data, pos):
+        datatype = "str"
+
+        # Read the first byte
+        first_byte = data[pos]
+    
+        # Extract the two most significant bits
+        msb = first_byte >> 6
+    
+        if msb == 0:  # 00: 6-bit encoding
+            length = first_byte & 0x3F
+            return datatype, length, 1
+        elif msb == 1:  # 01: 14-bit encoding
+            second_byte = data[pos+1]
+            length = ((first_byte & 0x3F) << 8) | second_byte
+            return datatype, length, 2
+        elif msb == 2:  # 10: 32-bit encoding
+            length = int.from_bytes(data[pos+1:pos+5], byteorder='little', signed=False)
+            return datatype, length, 5
+        else:  # 11: special encoding
+            fmt = first_byte & 0x3F
+            if fmt == 0x3:
+                datatype = "lzf"
+                raise ValueError("Compressed strings not supported")
+
+            if fmt == 0:
+                datatype = "int8"
+                return datatype, 1, 1
+
+            elif fmt == 1:
+                datatype = "int16"
+                return datatype, 2, 1
+
+            elif fmt == 2:
+                datatype = "int32"
+                return datatype, 4, 1
+            else:
+                raise ValueError("Invalid data")
+
+    def decode_string_encoding(self, data, pos):
+        datatype, str_len, consumed_bytes = self.decode_length_encoding(data, pos)
+        pos += consumed_bytes
+        string = ""
+        if datatype == "str":
+            string = data[pos:pos+str_len].decode('utf-8')
+        elif datatype[:3] == "int":
+            string = int.from_bytes(data[pos:pos+str_len], byteorder='little')
+        return string, consumed_bytes + str_len
+
+
+    def parse(self, stream: bytes):
+        streamlen = len(stream)
+        pos = 0
+
+        # Verify magic string
+        if self._state == "start":
+            if b"REDIS" != stream[pos:5]:
+                raise ValueError("Invalid magic string")
+
+            pos += 5
+            self._state = "magic"
+
+        # Get RDB version
+        version = 0
+        if self._state == "magic":
+            # Will raise ValueError on invalid data
+            version = int.from_bytes(stream[pos:9], byteorder='little')
+
+            pos += 4
+            self._state = "ver"
+            yield self._state, "RDB version", version, -1
+
+        # Parse rest of the stream
+        while pos < streamlen:
+            opcode = stream[pos]
+            pos += 1
+
+            if opcode == 0xFD:  # Expiry time in seconds
+                self._state = "key_val_s"
+
+                expiry = int.from_bytes(data[pos:pos+4], byteorder='little', signed=False)
+                pos += 4
+
+            elif opcode == 0xFC:  # Expiry time in milliseconds
+                self._state = "key_val_ms"
+
+                expiry = int.from_bytes(data[pos:pos+8], byteorder='little', signed=False) // 1000
+                pos += 8
+
+            elif opcode == 0xFA: # Auxiliary fields
+                self._state = "aux"
+
+                aux_key, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                aux_value, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                yield self._state, aux_key, aux_value, -1
+
+            elif opcode == 0xFE:  # Database selector
+                # Skip over database selector field
+                #pos += 1
+                datatype, dbnum_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                pos += consumed_bytes
+                if datatype == "str":
+                    dbnum = stream[pos:pos+dbnum_len].decode('utf-8')
+                elif datatype[:3] == "int":
+                    dbnum = int.from_bytes(stream[pos:pos+dbnum_len], byteorder='little')
+
+            elif opcode == 0xFB:  # Resize database
+                # Skip over resize database field
+                #pos += 4
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                pos += consumed_bytes
+                db_hash_tbl_size = int.from_bytes(stream[pos:pos+int_len], byteorder="little")
+
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                pos += consumed_bytes
+                exp_hash_tbl_size = int.from_bytes(stream[pos:pos+int_len], byteorder="little")
+
+            elif opcode == 0xFF:  # End of file marker
+                # CRC64 checksum disabled
+                if not self._rdbchecksum:
+                    break
+
+                # Verify CRC64 checksum
+                #expected_crc = struct.unpack('>Q', stream[pos:pos+8])[0]
+                #calculator = crc.Calculator(crc.Crc64.CRC64)
+                #actual_crc = calculator.checksum(stream[:pos])
+                #if actual_crc != expected_crc:
+                #    raise ValueError("CRC64 checksum verification failed")
+
+                break  # End of file, stop parsing
+
+            else:
+                if self._state[:3] != "key":
+                    self._state = "key_val"
+
+                pos -= 1
+
+                value_type = stream[pos]
+                pos += 1
+
+                key, consumed_bytes = self.decode_string_encoding(stream, pos)
+                pos += consumed_bytes
+
+                # Parse value based on type
+                if value_type == 0:  # String encoded as a Redis string
+                    value, consumed_bytes = self.decode_string_encoding(stream, pos)
+                    pos += consumed_bytes
+                elif value_type == 1:  # List
+                    pass
+                elif value_type == 2:  # Set
+                    pass
+
+                if 'expiry' in locals():
+                    yield self._state, key, value, expiry
+                    del expiry
+                else:
+                    yield self._state, key, value, -1
+
 
 def rdb_contents():
     hex_data = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
@@ -699,7 +925,7 @@ def check_expiry():
     while True:
         MAX_LOT_SIZE = 20
 
-        store_keys = store.keys()
+        store_keys = list(store.keys())
         store_size = len(store_keys)
         if store_size > 0:
             lot_size = store_size if store_size < MAX_LOT_SIZE else MAX_LOT_SIZE
@@ -872,20 +1098,21 @@ def main():
         type=str,
         help="Name of the RDB file"
     )
+    parser.add_argument(
+        "--rdbchecksum",
+        action="store_true",
+        help="Enable CRC64 checksum"
+    )
 
     args = parser.parse_args()
 
     # Configuration
-    dirpath = "/tmp/redis-data"
-    if args.dir:
-        dirpath = args.dir
-
-    dbfilename = "rdbfile"
-    if args.dbfilename:
-        dbfilename = args.dbfilename
+    dirpath = args.dir if args.dir else "./"
+    dbfilename = args.dbfilename if args.dbfilename else "dump.rdb"
+    rdbchecksum = args.rdbchecksum if args.rdbchecksum else True
 
     config = ServerConfig(
-        dirpath=dirpath, dbfilename=dbfilename
+        rdbchecksum=rdbchecksum, dirpath=dirpath, dbfilename=dbfilename
     )
 
     # Get port number
