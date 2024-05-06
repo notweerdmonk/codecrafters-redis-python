@@ -1,7 +1,7 @@
 # Uncomment this to pass the first stage
 import sys
 import socket
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, RLock
 from typing import Union, Any
 from enum import Enum
 import time
@@ -88,6 +88,33 @@ class RESPStr(str):
         return count, result
 
 
+class StreamEntry(dict):
+    def __init__(self, *args, **kwargs):
+        if "id" not in kwargs:
+            kwargs["id"] = "1526985054069-0"
+        super().__init__(*args, **kwargs)
+
+
+class Stream(list):
+    def __init__(self, *args):
+        for arg in args:
+            if isinstance(arg, StreamEntry):
+                self.append(arg)
+                return
+            elif isinstance(arg, list):
+                for obj in arg:
+                    if not isinstance(obj, StreamEntry):
+                        raise TypeError("Stream can only store StreamEntry objects")
+                super().__init__(arg)
+                return
+        raise ValueError("Invalid input. Must be a StreamEntry or a list of StreamEntry objects.")
+
+    def append(self, obj):
+        if not isinstance(obj, StreamEntry):
+            raise TypeError("Stream can only store StreamEntry objects")
+        super().append(obj)
+
+
 @dataclass
 class StoreElement(object):
     value: str
@@ -103,7 +130,7 @@ class Store(object):
         return cls._instance
 
     def __init__(self):
-        self._lock: Lock = Lock()
+        self._lock: RLock = RLock()
         self._store: dict[str, StoreElement] = {}
 
     def expired(self, key):
@@ -128,8 +155,36 @@ class Store(object):
         with self._lock:
             return list(self._store.keys())
 
+    def type(self, key: str):
+        with self._lock:
+            if key not in self._store:
+                return "none"
 
-    def set(self, key, value, expiry=-1):
+            e = self._store.get(key)
+            if not e:
+                return "none"
+
+            if isinstance(e.value, Stream):
+                return "stream"
+            elif len(e.value) > 0:
+                return "string"
+
+            return "none"
+
+
+    def append(self, key: str, value: StreamEntry):
+        with self._lock:
+            if key not in self._store:
+                self.set(key, Stream(value))
+                return value["id"]
+
+            if not isinstance(self._store[key], Stream):
+                return ""
+
+            self._store[key].append(value)
+            return value["id"]
+
+    def set(self, key: str, value: Union[str, Stream], expiry=-1):
         with self._lock:
             self._store[key] = StoreElement(
                 value, expiry
@@ -141,9 +196,14 @@ class Store(object):
                 return ""
 
             e = self._store[key]
+
+            if isinstance(e.value, Stream):
+                return ""
+
             if e.expiry > 0 and e.expiry <= millis():
                 self._store.pop(key)
                 return ""
+
             return e.value
 
     def delete(self, key):
@@ -531,12 +591,37 @@ class Server(object):
             if len(args) >= 1:
                 key = args[0]
 
-            value = store.get(key)
+            value_type = store.type(key)
 
-            if len(value) > 0:
-                response = RESPbuilder.build("string", bulkstr=False)
-            else:
-                response = RESPbuilder.build("none", bulkstr=False)
+            response = RESPbuilder.build(value_type, bulkstr=False)
+
+        elif command == "XADD":
+            if len(args) < 4:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key = args[0]
+            entry_id = args[1]
+
+            args = args[2:]
+            argslen = len(args)
+
+            stream_entry = StreamEntry(id=entry_id)
+
+            for i in range(0, argslen, 2):
+                k = args[i]
+                if i + 1 < argslen:
+                    v = args[i + 1]
+                else:
+                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+                stream_entry[k] = v
+
+            stored_id = store.append(key, stream_entry)
+
+            return RESPbuilder.build(stored_id)
 
         elif command == "SET":
             if len(args) < 2:
@@ -892,7 +977,8 @@ class RDBparser(object):
                 #calculator = crc.Calculator(crc.Crc64.CRC64)
                 #actual_crc = calculator.checksum(stream[:pos])
                 #if actual_crc != expected_crc:
-                #    raise ValueError("CRC64 checksum verification failed")
+                #    print("CRC64 checksum verification failed")
+                #    #raise ValueError("CRC64 checksum verification failed")
 
                 break  # End of file, stop parsing
 
