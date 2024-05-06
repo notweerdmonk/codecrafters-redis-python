@@ -114,10 +114,24 @@ class Stream(list):
             raise TypeError("Stream can only store StreamEntry objects")
         super().append(obj)
 
+    @staticmethod
+    def parse_id(id: str):
+        pattern = "([0-9]*)-(\d+)"
+        match = re.match(pattern, id)
+        groups = match.groups()
+
+        if len(groups) == 2:
+            return int(groups[0]), int(groups[1])
+
+        return 0, 0
+
+class StreamError(ValueError):
+    def __init__(self, message):
+        super(StreamError, self).__init__(message)
 
 @dataclass
 class StoreElement(object):
-    value: str
+    value: Union[str, Stream]
     expiry: float
 
 
@@ -171,17 +185,27 @@ class Store(object):
 
             return "none"
 
-
     def append(self, key: str, value: StreamEntry):
         with self._lock:
+            time, seq = Stream.parse_id(value["id"])
+            if time == 0 and seq < 1:
+                raise StreamError("The ID specified in XADD must be greater than 0-0")
+
             if key not in self._store:
                 self.set(key, Stream(value))
                 return value["id"]
 
-            if not isinstance(self._store[key], Stream):
+            if not isinstance(self._store[key].value, Stream):
                 return ""
 
-            self._store[key].append(value)
+            # Validate entry ID
+            top_entry = self._store[key].value[-1]
+            top_time, top_seq = Stream.parse_id(top_entry["id"])
+
+            if time < top_time or (time == top_time and seq <= top_seq):
+                raise StreamError("The ID specified in XADD is equal or smaller than the target stream top item")
+
+            self._store[key].value.append(value)
             return value["id"]
 
     def set(self, key: str, value: Union[str, Stream], expiry=-1):
@@ -285,6 +309,12 @@ class Connection(object):
 
                     try:
                         response = server.process_command(command, args, self)
+
+                    except StreamError as s:
+                        response = RESPbuilder.error(
+                            args=str(s),
+                            typ=RESPerror.CUSTOM,
+                        )
 
                     except ValueError as v:
                         sys.stderr.write(f"ValueError: {v}\n")
