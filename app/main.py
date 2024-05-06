@@ -116,12 +116,12 @@ class Stream(list):
 
     @staticmethod
     def parse_id(id: str):
-        pattern = "([0-9]*)-(\d+)"
+        pattern = "([0-9]*)-(\d+|\*)"
         match = re.match(pattern, id)
         groups = match.groups()
 
         if len(groups) == 2:
-            return int(groups[0]), int(groups[1])
+            return int(groups[0]), -1 if groups[1] == "*" else int(groups[1])
 
         return 0, 0
 
@@ -188,10 +188,18 @@ class Store(object):
     def append(self, key: str, value: StreamEntry):
         with self._lock:
             time, seq = Stream.parse_id(value["id"])
-            if time == 0 and seq < 1:
+            if time == 0 and seq == 0:
                 raise StreamError("The ID specified in XADD must be greater than 0-0")
 
             if key not in self._store:
+                if seq == -1:
+                    if time == 0:
+                        seq = 1
+                    else:
+                        seq = 0
+
+                    value["id"] = f"{str(time)}-{str(seq)}"
+
                 self.set(key, Stream(value))
                 return value["id"]
 
@@ -202,8 +210,16 @@ class Store(object):
             top_entry = self._store[key].value[-1]
             top_time, top_seq = Stream.parse_id(top_entry["id"])
 
-            if time < top_time or (time == top_time and seq <= top_seq):
+            if time < top_time or (time == top_time and seq != -1 and seq <= top_seq):
                 raise StreamError("The ID specified in XADD is equal or smaller than the target stream top item")
+
+            if seq == -1:
+                if time == top_time:
+                    seq = top_seq + 1
+                else:
+                    seq = 0
+
+                value["id"] = f"{str(time)}-{str(seq)}"
 
             self._store[key].value.append(value)
             return value["id"]
