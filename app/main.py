@@ -116,14 +116,14 @@ class Stream(list):
 
     @staticmethod
     def parse_id(id: str):
-        pattern = "([0-9]*)-(\d+|\*)"
+        pattern = "([0-9]*)-(\d+|\*)|(\*)"
         match = re.match(pattern, id)
-        groups = match.groups()
+        if match:
+            groups = match.groups()
+            if groups[0] is not None and groups[1] is not None:
+                return int(groups[0]), -1 if groups[1] == "*" else int(groups[1])
 
-        if len(groups) == 2:
-            return int(groups[0]), -1 if groups[1] == "*" else int(groups[1])
-
-        return 0, 0
+        return -1, -1
 
 class StreamError(ValueError):
     def __init__(self, message):
@@ -190,6 +190,9 @@ class Store(object):
             time, seq = Stream.parse_id(value["id"])
             if time == 0 and seq == 0:
                 raise StreamError("The ID specified in XADD must be greater than 0-0")
+
+            if time == -1:
+                time = millis()
 
             if key not in self._store:
                 if seq == -1:
