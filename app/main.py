@@ -805,7 +805,7 @@ class Server(object):
             response = RESPbuilder.build(stream[start_idx : end_idx + 1])
 
         elif command == "XREAD":
-            if len(args) < 3:
+            if len(args) < 2:
                 if not conn:
                     return None
 
