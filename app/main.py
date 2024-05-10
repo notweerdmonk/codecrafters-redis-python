@@ -88,11 +88,71 @@ class RESPStr(str):
         return count, result
 
 
+@dataclass
+class StreamEntryId(object):
+    time: int
+    seq: int
+
+    def build(self):
+        return f"{str(self.time)}-{str(self.seq)}"
+
+
 class StreamEntry(dict):
     def __init__(self, *args, **kwargs):
         if "id" not in kwargs:
-            kwargs["id"] = "1526985054069-0"
+            kwargs["id"] = f"{str(millis())}-0"
         super().__init__(*args, **kwargs)
+
+    def __lt__(self, other):
+        if "id" in self and "id" in other:
+            #return self["id"] < other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time > other_time:
+                return False
+            elif time == other_time:
+                if seq < other_seq:
+                    return True
+                else:
+                    return False
+            return True
+        else:
+            raise ValueError("Both objects must have an 'id' key for comparison")
+
+    def __gt__(self, other):
+        if "id" in self and "id" in other:
+            #return self["id"] > other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time < other_time:
+                return False
+            elif time == other_time:
+                if seq > other_seq:
+                    return True
+                else:
+                    return False
+            return True
+        else:
+            raise ValueError("Both objects must have an 'id' key for comparison")
+
+    def __eq__(self, other):
+        if "id" in self and "id" in other:
+            #return self["id"] == other["id"]
+
+            time, seq = Stream.parse_id(self["id"])
+            other_time, other_seq = Stream.parse_id(other["id"])
+
+            if time != other_time:
+                return False
+            if seq != other_seq:
+                return False
+            return True
+        else:
+            raise ValueError("Both objects must have an 'id' key for comparison")
 
 
 class Stream(list):
@@ -114,14 +174,46 @@ class Stream(list):
             raise TypeError("Stream can only store StreamEntry objects")
         super().append(obj)
 
+    def search(self, id: str, end=True):
+        lo = 0
+        hi = len(self) - 1
+        closest = None
+
+        if id == "-":
+            return lo
+        if id == "+":
+            return hi
+
+        time, seq = Stream.parse_id(id)
+        if seq == -1:
+            seq = Stream.parse_id(self[-1]["id"])[1] if end else 0
+            id = f"{str(time)}-{str(seq)}"
+
+        se = StreamEntry(id=id)
+        
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            
+            if se < self[mid]:
+                hi = mid - 1
+            elif se > self[mid]:
+                closest = mid
+                lo = mid + 1
+            else:
+                return mid
+
+        return closest if end else lo
+
     @staticmethod
     def parse_id(id: str):
-        pattern = "([0-9]*)-(\d+|\*)|(\*)"
+        pattern = r"(\d+)(?:-(\d+|\*))?|(\*)"
         match = re.match(pattern, id)
         if match:
             groups = match.groups()
             if groups[0] is not None and groups[1] is not None:
                 return int(groups[0]), -1 if groups[1] == "*" else int(groups[1])
+            if groups[0] is not None:
+                return int(groups[0]), -1
 
         return -1, -1
 
@@ -239,9 +331,6 @@ class Store(object):
                 return ""
 
             e = self._store[key]
-
-            if isinstance(e.value, Stream):
-                return ""
 
             if e.expiry > 0 and e.expiry <= millis():
                 self._store.pop(key)
@@ -672,6 +761,27 @@ class Server(object):
 
             return RESPbuilder.build(stored_id)
 
+        elif command == "XRANGE":
+            if len(args) < 3:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key = args[0]
+
+            start_id = args[1]
+            end_id = args[2]
+
+            stream = store.get(key)
+            if not stream:
+                return RESPbuilder.null()
+
+            start_idx = stream.search(start_id, end=False)
+            end_idx = stream.search(end_id)
+
+            response = RESPbuilder.build(stream[start_idx : end_idx + 1])
+
         elif command == "SET":
             if len(args) < 2:
                 if not conn:
@@ -707,11 +817,15 @@ class Server(object):
 
             if nargs == 1:
                 values = store.get(args[0])
+                if isinstance(values, Stream):
+                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
 
             else:
                 values = []
                 for i in range(nargs):
                     value = store.get(args[i])
+                    if isinstance(value, Stream):
+                        return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
                     values.append(value)
 
             response = RESPbuilder.build(values)
@@ -802,11 +916,21 @@ class RESPparser(object):
 class RESPerror(Enum):
     WRONG_ARGS = 1
     UNKNOWN_CMD = 2
-    SYNTAX = 3
-    CUSTOM = 4
+    WRONGTYPE = 3
+    SYNTAX = 4
+    CUSTOM = 5
 
 
 class RESPbuilder(object):
+
+    @classmethod
+    def resolve_entry(cls, entry: StreamEntry):
+        l = []
+        keys = list(entry.keys())[1:]
+        for key in keys:
+            l.append(key)
+            l.append(entry[key])
+        return [entry["id"], l]
 
     @classmethod
     def null(cls):
@@ -814,7 +938,7 @@ class RESPbuilder(object):
 
     @classmethod
     def build(
-        cls, data: Union[int, str, list], bulkstr: bool = True, rdb: bool = False
+        cls, data: Union[int, str, list, StreamEntry, Stream], bulkstr: bool = True, rdb: bool = False
     ):
         typ = type(data)
 
@@ -839,6 +963,18 @@ class RESPbuilder(object):
         elif typ == list:
             return f"*{len(data)}\r\n".encode() + "".encode().join(map(cls.build, data))
 
+        elif typ == StreamEntry:
+            streamentryl = RESPbuilder.resolve_entry(data)
+
+            return RESPbuilder.build(streamentryl)
+
+        elif typ == Stream:
+            streaml = []
+            for entry in data:
+                streaml.append(RESPbuilder.resolve_entry(entry))
+
+            return RESPbuilder.build(streaml)
+
         else:
             raise TypeError(f"Unsupported type: {typ}")
 
@@ -857,6 +993,12 @@ class RESPbuilder(object):
             return (
                 f"-ERR unknown command `{command}`, "
                 f"with args beginning with: {arg1}\r\n".encode()
+            )
+
+        elif typ == RESPerror.WRONGTYPE:
+            return (
+                "-WRONGTYPE Operation against a key holding the wrong kind of "
+                "value\r\n".encode()
             )
 
         elif typ == RESPerror.SYNTAX:
@@ -1215,6 +1357,7 @@ def handle_master_conn(host, port):
                     master_socket.sendall(response)
                 repl_offset += n
                 at += n
+
 
 # Globals
 store = Store()
