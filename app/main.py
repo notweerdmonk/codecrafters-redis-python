@@ -11,8 +11,9 @@ import argparse
 import secrets
 import re
 import struct
-#import fastcrc
-#import crc
+
+# import fastcrc
+# import crc
 
 
 def millis():
@@ -105,7 +106,7 @@ class StreamEntry(dict):
 
     def __lt__(self, other):
         if "id" in self and "id" in other:
-            #return self["id"] < other["id"]
+            # return self["id"] < other["id"]
 
             time, seq = Stream.parse_id(self["id"])
             other_time, other_seq = Stream.parse_id(other["id"])
@@ -123,7 +124,7 @@ class StreamEntry(dict):
 
     def __gt__(self, other):
         if "id" in self and "id" in other:
-            #return self["id"] > other["id"]
+            # return self["id"] > other["id"]
 
             time, seq = Stream.parse_id(self["id"])
             other_time, other_seq = Stream.parse_id(other["id"])
@@ -141,7 +142,7 @@ class StreamEntry(dict):
 
     def __eq__(self, other):
         if "id" in self and "id" in other:
-            #return self["id"] == other["id"]
+            # return self["id"] == other["id"]
 
             time, seq = Stream.parse_id(self["id"])
             other_time, other_seq = Stream.parse_id(other["id"])
@@ -167,7 +168,9 @@ class Stream(list):
                         raise TypeError("Stream can only store StreamEntry objects")
                 super().__init__(arg)
                 return
-        raise ValueError("Invalid input. Must be a StreamEntry or a list of StreamEntry objects.")
+        raise ValueError(
+            "Invalid input. Must be a StreamEntry or a list of StreamEntry objects."
+        )
 
     def append(self, obj):
         if not isinstance(obj, StreamEntry):
@@ -185,15 +188,18 @@ class Stream(list):
             return hi
 
         time, seq = Stream.parse_id(id)
+        if time == -1:
+            return None
+
         if seq == -1:
             seq = Stream.parse_id(self[-1]["id"])[1] if end else 0
             id = f"{str(time)}-{str(seq)}"
 
         se = StreamEntry(id=id)
-        
+
         while lo <= hi:
             mid = (lo + hi) // 2
-            
+
             if se < self[mid]:
                 hi = mid - 1
             elif se > self[mid]:
@@ -217,9 +223,11 @@ class Stream(list):
 
         return -1, -1
 
+
 class StreamError(ValueError):
     def __init__(self, message):
         super(StreamError, self).__init__(message)
+
 
 @dataclass
 class StoreElement(object):
@@ -306,7 +314,9 @@ class Store(object):
             top_time, top_seq = Stream.parse_id(top_entry["id"])
 
             if time < top_time or (time == top_time and seq != -1 and seq <= top_seq):
-                raise StreamError("The ID specified in XADD is equal or smaller than the target stream top item")
+                raise StreamError(
+                    "The ID specified in XADD is equal or smaller than the target stream top item"
+                )
 
             if seq == -1:
                 if time == top_time:
@@ -321,9 +331,7 @@ class Store(object):
 
     def set(self, key: str, value: Union[str, Stream], expiry=-1):
         with self._lock:
-            self._store[key] = StoreElement(
-                value, expiry
-            )
+            self._store[key] = StoreElement(value, expiry)
 
     def get(self, key):
         with self._lock:
@@ -448,6 +456,7 @@ class ServerRole(Enum):
     MASTER = "master"
     SLAVE = "slave"
 
+
 @dataclass
 class ConfigObject(object):
     name: str = ""
@@ -455,6 +464,7 @@ class ConfigObject(object):
 
     def build(self):
         return [self.name, str(self.value)]
+
 
 class ServerConfig(object):
     dirpath: ConfigObject = ConfigObject(name="dir")
@@ -471,6 +481,7 @@ class ServerConfig(object):
 
     def __repr__(self):
         return f"ServerConfig(rdbchecksum={self.rdbchecksum}, dirpath={self.dirpath}, dbfilename={self.dbfilename})"
+
 
 class Server(object):
     _instance = None
@@ -495,8 +506,12 @@ class Server(object):
             if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
                 store.set(key, value, expiry)
 
-
-    def __init__(self, config: ServerConfig, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+    def __init__(
+        self,
+        config: ServerConfig,
+        port: int = 6379,
+        role: ServerRole = ServerRole.MASTER,
+    ):
         self._host = "localhost"
         self._port = port
         self._role = role
@@ -547,6 +562,12 @@ class Server(object):
 
         # in case command is not in upper-case letters
         command = command.upper()
+
+        new_args = []
+        for arg in args:
+            for s in arg.split():
+                new_args.append(s)
+        args = new_args
 
         print(f"Received command {command}, args {args}")
 
@@ -619,10 +640,10 @@ class Server(object):
                         opt = o.lower()
                         if opt == "dir":
                             payload += self.config.dirpath.build()
-    
+
                         elif opt == "dbfilename":
                             payload += self.config.dbfilename.build()
-    
+
                 response = RESPbuilder.build(payload)
 
         elif command == "REPLCONF":
@@ -769,18 +790,78 @@ class Server(object):
                 return RESPbuilder.error(command)
 
             key = args[0]
-
             start_id = args[1]
             end_id = args[2]
 
             stream = store.get(key)
             if not stream:
                 return RESPbuilder.null()
+            if not isinstance(stream, Stream):
+                return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
 
             start_idx = stream.search(start_id, end=False)
             end_idx = stream.search(end_id)
 
             response = RESPbuilder.build(stream[start_idx : end_idx + 1])
+
+        elif command == "XREAD":
+            if len(args) < 3:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            start_idx = 0
+            if "streams" in args:
+                start_idx = args.index("streams") + 1
+
+            elif "STREAMS" in args:
+                start_idx = args.index("STREAMS") + 1
+
+            else:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(command)
+
+            key_id_len = len(args[start_idx:])
+            if key_id_len % 2 != 0:
+                return RESPbuilder.error(
+                    args="Unbalanced XREAD list of streams: for each stream "
+                    "key an ID or '$' must be specified",
+                    typ=RESPerror.CUSTOM,
+                )
+
+            key_id_len = key_id_len // 2
+
+            key_id_list = []
+            for i in range(start_idx, start_idx + key_id_len):
+                key = args[i]
+                id = args[i + key_id_len]
+                key_id_list.append((key, id))
+
+            streams = []
+            for key, id in key_id_list:
+                stream = store.get(key)
+                if not stream:
+                    continue
+                if not isinstance(stream, Stream):
+                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+                idx = stream.search(id, end=False)
+                if idx is None:
+                    return RESPbuilder.error(
+                        args="Invalid stream ID specified as stream command "
+                        "argument",
+                        typ=RESPerror.CUSTOM,
+                    )
+
+                if idx < len(stream):
+                    streams.append([key, stream[idx:]])
+
+            response = (
+                RESPbuilder.build(streams) if len(streams) > 0 else RESPbuilder.null()
+            )
 
         elif command == "SET":
             if len(args) < 2:
@@ -938,7 +1019,10 @@ class RESPbuilder(object):
 
     @classmethod
     def build(
-        cls, data: Union[int, str, list, StreamEntry, Stream], bulkstr: bool = True, rdb: bool = False
+        cls,
+        data: Union[int, str, list, StreamEntry, Stream],
+        bulkstr: bool = True,
+        rdb: bool = False
     ):
         typ = type(data)
 
@@ -980,7 +1064,10 @@ class RESPbuilder(object):
 
     @classmethod
     def error(
-        cls, command: str = "", args: list = None, typ: RESPerror = RESPerror.WRONG_ARGS
+        cls,
+        command: str = "",
+        args: list = None,
+        typ: RESPerror = RESPerror.WRONG_ARGS
     ):
         if typ == RESPerror.WRONG_ARGS:
             return (
@@ -1010,6 +1097,7 @@ class RESPbuilder(object):
         else:
             raise RuntimeError("Unknown error type")
 
+
 class RDBparser(object):
     _states = [
         "start",
@@ -1021,40 +1109,35 @@ class RDBparser(object):
         "key_val_ms",
         "key_val",
         "eof",
-        "chksum"
+        "chksum",
     ]
 
-    _datatypes = [
-        "str",
-        "int8",
-        "int16",
-        "int32",
-        "lzf"
-    ]
+    _datatypes = ["str", "int8", "int16", "int32", "lzf"]
 
     def __init__(self, rdbchecksum: bool = True):
         self._state = RDBparser._states[0]
         self._rdbchecksum = rdbchecksum
-
 
     def decode_length_encoding(self, data, pos):
         datatype = "str"
 
         # Read the first byte
         first_byte = data[pos]
-    
+
         # Extract the two most significant bits
         msb = first_byte >> 6
-    
+
         if msb == 0:  # 00: 6-bit encoding
             length = first_byte & 0x3F
             return datatype, length, 1
         elif msb == 1:  # 01: 14-bit encoding
-            second_byte = data[pos+1]
+            second_byte = data[pos + 1]
             length = ((first_byte & 0x3F) << 8) | second_byte
             return datatype, length, 2
         elif msb == 2:  # 10: 32-bit encoding
-            length = int.from_bytes(data[pos+1:pos+5], byteorder='little', signed=False)
+            length = int.from_bytes(
+                data[pos + 1 : pos + 5], byteorder="little", signed=False
+            )
             return datatype, length, 5
         else:  # 11: special encoding
             fmt = first_byte & 0x3F
@@ -1081,11 +1164,10 @@ class RDBparser(object):
         pos += consumed_bytes
         string = ""
         if datatype == "str":
-            string = data[pos:pos+str_len].decode('utf-8')
+            string = data[pos : pos + str_len].decode("utf-8")
         elif datatype[:3] == "int":
-            string = int.from_bytes(data[pos:pos+str_len], byteorder='little')
+            string = int.from_bytes(data[pos : pos + str_len], byteorder="little")
         return string, consumed_bytes + str_len
-
 
     def parse(self, stream: bytes):
         streamlen = len(stream)
@@ -1103,7 +1185,7 @@ class RDBparser(object):
         version = 0
         if self._state == "magic":
             # Will raise ValueError on invalid data
-            version = int.from_bytes(stream[pos:9], byteorder='little')
+            version = int.from_bytes(stream[pos:9], byteorder="little")
 
             pos += 4
             self._state = "ver"
@@ -1117,16 +1199,20 @@ class RDBparser(object):
             if opcode == 0xFD:  # Expiry time in seconds
                 self._state = "key_val_s"
 
-                expiry = int.from_bytes(stream[pos:pos+4], byteorder='little', signed=False)
+                expiry = int.from_bytes(
+                    stream[pos : pos + 4], byteorder="little", signed=False
+                )
                 pos += 4
 
             elif opcode == 0xFC:  # Expiry time in milliseconds
                 self._state = "key_val_ms"
 
-                expiry = int.from_bytes(stream[pos:pos+8], byteorder='little', signed=False)
+                expiry = int.from_bytes(
+                    stream[pos : pos + 8], byteorder="little", signed=False
+                )
                 pos += 8
 
-            elif opcode == 0xFA: # Auxiliary fields
+            elif opcode == 0xFA:  # Auxiliary fields
                 self._state = "aux"
 
                 aux_key, consumed_bytes = self.decode_string_encoding(stream, pos)
@@ -1139,24 +1225,36 @@ class RDBparser(object):
 
             elif opcode == 0xFE:  # Database selector
                 # Skip over database selector field
-                #pos += 1
-                datatype, dbnum_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                # pos += 1
+                datatype, dbnum_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
                 pos += consumed_bytes
                 if datatype == "str":
-                    dbnum = stream[pos:pos+dbnum_len].decode('utf-8')
+                    dbnum = stream[pos : pos + dbnum_len].decode("utf-8")
                 elif datatype[:3] == "int":
-                    dbnum = int.from_bytes(stream[pos:pos+dbnum_len], byteorder='little')
+                    dbnum = int.from_bytes(
+                        stream[pos : pos + dbnum_len], byteorder="little"
+                    )
 
             elif opcode == 0xFB:  # Resize database
                 # Skip over resize database field
-                #pos += 4
-                datatype, int_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                # pos += 4
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
                 pos += consumed_bytes
-                db_hash_tbl_size = int.from_bytes(stream[pos:pos+int_len], byteorder="little")
+                db_hash_tbl_size = int.from_bytes(
+                    stream[pos : pos + int_len], byteorder="little"
+                )
 
-                datatype, int_len, consumed_bytes = self.decode_length_encoding(stream, pos)
+                datatype, int_len, consumed_bytes = self.decode_length_encoding(
+                    stream, pos
+                )
                 pos += consumed_bytes
-                exp_hash_tbl_size = int.from_bytes(stream[pos:pos+int_len], byteorder="little")
+                exp_hash_tbl_size = int.from_bytes(
+                    stream[pos : pos + int_len], byteorder="little"
+                )
 
             elif opcode == 0xFF:  # End of file marker
                 # CRC64 checksum disabled
@@ -1164,10 +1262,10 @@ class RDBparser(object):
                     break
 
                 # Verify CRC64 checksum
-                #expected_crc = struct.unpack('>Q', stream[pos:pos+8])[0]
-                #calculator = crc.Calculator(crc.Crc64.CRC64)
-                #actual_crc = calculator.checksum(stream[:pos])
-                #if actual_crc != expected_crc:
+                # expected_crc = struct.unpack('>Q', stream[pos:pos+8])[0]
+                # calculator = crc.Calculator(crc.Crc64.CRC64)
+                # actual_crc = calculator.checksum(stream[:pos])
+                # if actual_crc != expected_crc:
                 #    print("CRC64 checksum verification failed")
                 #    #raise ValueError("CRC64 checksum verification failed")
 
@@ -1194,7 +1292,7 @@ class RDBparser(object):
                 elif value_type == 2:  # Set
                     pass
 
-                if 'expiry' in locals():
+                if "expiry" in locals():
                     yield self._state, key, value, expiry
                     del expiry
                 else:
@@ -1379,19 +1477,11 @@ def main():
         help="Set the host and port of the master to replicate",
     )
     parser.add_argument(
-        "--dir",
-        type=str,
-        help="Path to directory where RDB file gets stored"
+        "--dir", type=str, help="Path to directory where RDB file gets stored"
     )
+    parser.add_argument("--dbfilename", type=str, help="Name of the RDB file")
     parser.add_argument(
-        "--dbfilename",
-        type=str,
-        help="Name of the RDB file"
-    )
-    parser.add_argument(
-        "--rdbchecksum",
-        action="store_true",
-        help="Enable CRC64 checksum"
+        "--rdbchecksum", action="store_true", help="Enable CRC64 checksum"
     )
 
     args = parser.parse_args()
