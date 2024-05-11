@@ -89,15 +89,6 @@ class RESPStr(str):
         return count, result
 
 
-@dataclass
-class StreamEntryId(object):
-    time: int
-    seq: int
-
-    def build(self):
-        return f"{str(self.time)}-{str(self.seq)}"
-
-
 class StreamEntry(dict):
     def __init__(self, *args, **kwargs):
         if "id" not in kwargs:
