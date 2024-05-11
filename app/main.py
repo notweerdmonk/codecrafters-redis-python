@@ -485,26 +485,7 @@ class ServerConfig(object):
 
 class Server(object):
     _instance = None
-    PROPAGATED_COMMANDS = ["SET", "DEL"]
-
-    def read_rdb(self):
-        global store
-
-        rdbdata = b""
-        rdbpath = self.config.dirpath.value + "/" + self.config.dbfilename.value
-
-        parser = RDBparser()
-        try:
-            with open(rdbpath, "rb") as f:
-                rdbdata = f.read()
-
-        except FileNotFoundError as e:
-            print(f"RDB file {rdbpath} not found")
-            rdbdata = rdb_contents()
-
-        for state, key, value, expiry in parser.parse(rdbdata):
-            if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
-                store.set(key, value, expiry)
+    PROPAGATED_COMMANDS = ["SET", "DEL", "XADD"]
 
     def __init__(
         self,
@@ -517,6 +498,8 @@ class Server(object):
         self._role = role
         self._replicas = []
         self.ackcount = 0
+        self._xadd_ev = Event()
+        self._xadd_streams = set()
 
         self.master_replid = secrets.token_hex(20)
         self.master_repl_offset = 0
@@ -525,7 +508,11 @@ class Server(object):
 
         self.read_rdb()
 
-    def __new__(cls, port: int = 6379, role: ServerRole = ServerRole.MASTER):
+    def __new__(
+        cls,
+        port: int = 6379,
+        role: ServerRole = ServerRole.MASTER
+    ):
         if cls._instance is None:
             cls._instance = super(Server, cls).__new__(cls)
             cls._instance.__init__(port, role)
@@ -554,7 +541,12 @@ class Server(object):
         for r in self._replicas:
             r.relay(msg)
 
-    def process_command(self, command: str, args: list, conn: Connection = None):
+    def process_command(
+        self,
+        command: str,
+        args: list,
+        conn: Connection = None
+    ):
         global store
         global repl_offset
 
@@ -563,6 +555,7 @@ class Server(object):
         # in case command is not in upper-case letters
         command = command.upper()
 
+        # in case there are quote enclosed arguments
         new_args = []
         for arg in args:
             for s in arg.split():
@@ -780,7 +773,16 @@ class Server(object):
 
             stored_id = store.append(key, stream_entry)
 
-            return RESPbuilder.build(stored_id)
+            # set XADD event
+            if key in self._xadd_streams:
+                print("setting xadd event")
+                self._xadd_streams.remove(key)
+                self._xadd_ev.set()
+
+            if not conn:
+                return None
+
+            response = RESPbuilder.build(stored_id)
 
         elif command == "XRANGE":
             if len(args) < 3:
@@ -805,11 +807,20 @@ class Server(object):
             response = RESPbuilder.build(stream[start_idx : end_idx + 1])
 
         elif command == "XREAD":
-            if len(args) < 2:
+            if len(args) < 1:
                 if not conn:
                     return None
 
                 return RESPbuilder.error(command)
+
+            block = False
+            block_time = 0
+            if "block" in args:
+                block = True
+                block_time = int(args[args.index("block") + 1])
+            elif "BLOCK" in args:
+                block = True
+                block_time = int(args[args.index("BLOCK") + 1])
 
             start_idx = 0
             if "streams" in args:
@@ -831,6 +842,8 @@ class Server(object):
                     "key an ID or '$' must be specified",
                     typ=RESPerror.CUSTOM,
                 )
+            if key_id_len == 0:
+                return RESPbuilder.error(command)
 
             key_id_len = key_id_len // 2
 
@@ -848,6 +861,9 @@ class Server(object):
                 if not isinstance(stream, Stream):
                     return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
 
+                if id == "$":
+                    continue
+
                 idx = stream.search(id, end=False)
                 if idx is None:
                     return RESPbuilder.error(
@@ -856,8 +872,49 @@ class Server(object):
                         typ=RESPerror.CUSTOM,
                     )
 
-                if idx < len(stream):
+                streamlen = len(stream)
+                if idx < streamlen and id >= stream[idx]["id"]:
+                    idx += 1
+                if idx < streamlen:
                     streams.append([key, stream[idx:]])
+
+            if block and len(streams) == 0:
+                for i in range(len(key_id_list)):
+                    key, id = key_id_list[i]
+                    self._xadd_streams.add(key)
+                    if id == "$":
+                        stream = store.get(key)
+                        if not stream:
+                            continue
+                        key_id_list[i] = (key, stream[-1]["id"])
+                        print(key_id_list[i])
+
+                self._xadd_ev.clear()
+                if block_time > 0:
+                    self._xadd_ev.wait(block_time / 1000)
+                else:
+                    self._xadd_ev.wait()
+                
+                for key, id in key_id_list:
+                    stream = store.get(key)
+                    if not stream:
+                        continue
+                    if not isinstance(stream, Stream):
+                        return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+                    idx = stream.search(id, end=False)
+                    if idx is None:
+                        return RESPbuilder.error(
+                            args="Invalid stream ID specified as stream command "
+                            "argument",
+                            typ=RESPerror.CUSTOM,
+                        )
+
+                    streamlen = len(stream)
+                    if idx < streamlen and id >= stream[idx]["id"]:
+                        idx += 1
+                    if idx < streamlen:
+                        streams.append([key, stream[idx:]])
 
             response = (
                 RESPbuilder.build(streams) if len(streams) > 0 else RESPbuilder.null()
@@ -930,6 +987,25 @@ class Server(object):
             response = RESPbuilder.build(keys_deleted)
 
         return response
+
+    def read_rdb(self):
+        global store
+
+        rdbdata = b""
+        rdbpath = self.config.dirpath.value + "/" + self.config.dbfilename.value
+
+        parser = RDBparser()
+        try:
+            with open(rdbpath, "rb") as f:
+                rdbdata = f.read()
+
+        except FileNotFoundError as e:
+            print(f"RDB file {rdbpath} not found")
+            rdbdata = rdb_contents()
+
+        for state, key, value, expiry in parser.parse(rdbdata):
+            if state[:7] == "key_val" and (expiry == -1 or expiry > millis()):
+                store.set(key, value, expiry)
 
 
 class RESPparser(object):
@@ -1432,7 +1508,7 @@ def handle_master_conn(host, port):
         while at < datalen:
             n, tokens = RESPparser.parse(data[at:])
             command, *args = tokens
-            response = server.process_command(command.upper(), args)
+            response = server.process_command(command, args)
             if response and len(response) > 0:
                 master_socket.sendall(response)
             repl_offset += n
@@ -1441,7 +1517,7 @@ def handle_master_conn(host, port):
     with master_socket:
         while True:
             data = master_socket.recv(4096)
-            # print(f'Received from master: {data}')
+            #print(f'Received from master: {data}')
             if not data:
                 break
 
@@ -1450,7 +1526,7 @@ def handle_master_conn(host, port):
             while at < datalen:
                 n, tokens = RESPparser.parse(data[at:])
                 command, *args = tokens
-                response = server.process_command(command.upper(), args)
+                response = server.process_command(command, args)
                 if response and len(response) > 0:
                     master_socket.sendall(response)
                 repl_offset += n
