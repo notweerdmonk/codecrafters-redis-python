@@ -1,7 +1,7 @@
 import sys
 import socket
 from threading import Thread, Lock, Event, RLock, Condition
-from typing import Union, Any
+from typing import Union, Any, Callable
 from enum import Enum
 import time
 import random
@@ -1075,26 +1075,98 @@ class Command(object):
     firstkey: int = 0
     lastkey: int = 0
     step: int = 0
+    processor: Callable = None
 
     def __init__(
         self,
-        name: str,
-        arity: int,
-        flags: list,
-        firstkey: int,
-        lastkey: int,
-        step: int
+        processor: Callable,
+        name: str = None,
+        arity: int = None,
+        flags: list = None,
+        firstkey: int = None,
+        lastkey: int = None,
+        step: int = None,
+        tokens: list = None
     ):
-        self.name = name
-        self.arity = arity
-        self.flags = flags
-        self.firstkey = firstkey
-        self.lastkey = lastkey
-        self.step = step 
+        if not callable(processor):
+            raise ValueError("Argument processor should be callable")
+        self.processor = processor
+
+        if tokens == None:
+            self.name = name
+            self.arity = arity
+            self.flags = flags
+            self.firstkey = firstkey
+            self.lastkey = lastkey
+            self.step = step 
+
+        else:
+            self.extract(tokens)
+
+    def __call__(self, args: list, conn = None):
+        self._processor(args, conn)
 
     def build(self):
-        pass
+        return [
+            self.name,
+            self.arity,
+            self.flags,
+            self.firstkey,
+            self.lastkey,
+            self.step
+        ]
 
+    def extract(self, tokens: list):
+        if len(tokens) != 6:
+            raise ValueError("Number of tokens is not six")
+
+        self.name = tokens[0]
+        self.arity = tokens[1]
+        self.flags = tokens[2]
+        self.firstkey = tokens[3]
+        self.lastkey= tokens[4]
+        self.step = tokens[5]
+
+    def __repr__(self):
+        return f"Command: {self.name}\n"\
+               f"    Arity: {self.arity}\n"\
+               f"    Flags: {self.flags}\n"\
+               f"    First Key: {self.firstkey}\n"\
+               f"    Last Key: {self.lastkey}\n"\
+               f"    Step: {self.step}\n"
+
+
+class Cmdprocessor(list):
+    def __init__(self, *args):
+        for arg in args:
+            if isinstance(arg, Command):
+                self.append(arg)
+                return
+            elif isinstance(arg, list):
+                for obj in arg:
+                    if not isinstance(obj, Command):
+                        raise TypeError("Cmdprocessor can only store Command objects")
+                super(Cmdprocessor, self).__init__(arg)
+                return
+        raise ValueError(
+            "Invalid input. Must be a Command or a list of Command objects."
+        )
+
+    def append(self, obj):
+        if not isinstance(obj, Command):
+            raise TypeError("Stream can only store Command objects")
+        super(Cmdprocessor, self).append(obj)
+
+    def __call__(self, command: str, cmdargs: list, *args):
+        for cmd in self:
+            if command == cmd.name:
+                return cmd.processor(cmd, cmdargs, *args)
+
+    def build(self):
+        commands = []
+        for cmd in self:
+            commands.append(cmd.build())
+        return commands
 
 class ServerRole(Enum):
     MASTER = "master"
@@ -1167,7 +1239,6 @@ class ServerConfig(object):
 
 class Server(object):
     _instance = None
-    PROPAGATED_COMMANDS = ["SET", "DEL", "XADD"]
 
     @classmethod
     def default_config(cls):
@@ -1183,6 +1254,191 @@ class Server(object):
         config: ServerConfig = ServerConfig(),
         role: ServerRole = ServerRole.MASTER,
     ):
+        self.PROPAGATED_COMMANDS = [
+            "SET",
+            "DEL",
+            "XADD"
+        ]
+
+        self._cmd_processor = Cmdprocessor([
+            Command(
+                self.cmdproc_command,
+                tokens = [
+                    "COMMAND",
+                    0,
+                    ["random", "loading", "stale"],
+                    0,
+                    0,
+                    0
+                ],
+            ),
+            Command(
+                self.cmdproc_ping,
+                tokens = [
+                    "PING",
+                    -1,
+                    ["stale", "fast"],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_echo,
+                tokens = [
+                    "ECHO",
+                    2,
+                    ["fast"],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_info,
+                tokens = [
+                    "INFO",
+                    -1,
+                    ["random", "loading", "stale"],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_config,
+                tokens = [
+                    "CONFIG",
+                    -2,
+                    ["admin", "noscript", "loading", "stale"],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_replconf,
+                tokens = [
+                    "REPLCONF",
+                    -1,
+                    ['admin', 'noscript', 'loading', 'stale'],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_psync,
+                tokens = [
+                    "PSYNC",
+                    3,
+                    ['readonly', 'admin', 'noscript'],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_wait,
+                tokens = [
+                    "WAIT",
+                    3,
+                    ['noscript'],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_keys,
+                tokens = [
+                    "KEYS",
+                    2,
+                    ['readonly', 'sort_for_script'],
+                    0,
+                    0,
+                    0
+                ]
+            ),
+            Command(
+                self.cmdproc_type,
+                tokens = [
+                    "TYPE",
+                    2,
+                    ['readonly', 'fast'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_xadd,
+                tokens = [
+                    "XADD",
+                    -5,
+                    ['write', 'denyoom', 'random', 'fast'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_xrange,
+                tokens = [
+                    "XRANGE",
+                    -4,
+                    ['readonly'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_xread,
+                tokens = [
+                    "XREAD",
+                    -4,
+                    ['readonly', 'noscript', 'movablekeys'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_set,
+                tokens = [
+                    "SET",
+                    -3,
+                    ['write', 'denyoom'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_get,
+                tokens = [
+                    "GET",
+                    2,
+                    ['readonly', 'fast'],
+                    1,
+                    1,
+                    1
+                ]
+            ),
+            Command(
+                self.cmdproc_del,
+                tokens = [
+                    "DEL",
+                    -2,
+                    ['write'],
+                    1,
+                    -1,
+                    1
+                ]
+            )
+        ])
+
         if store is None:
             raise ValueError("Argument store cannot be None")
         if not isinstance(store, Store):
@@ -1350,6 +1606,438 @@ class Server(object):
 
         return streams, None
 
+    """
+    Start of command processors
+    """
+    def cmdproc_command(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        payload = self._cmd_processor.build()
+
+        return RESPbuilder.build(payload)
+
+    def cmdproc_ping(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        argslen = len(args)
+        if argslen > 1:
+            return RESPerror.error(cmd.name)
+
+        if argslen == 1:
+            response = RESPbuilder.build(args[0])
+        else:
+            response = RESPbuilder.build("PONG", bulkstr=False)
+
+        return response
+
+    def cmdproc_echo(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        argslen = len(args)
+        if argslen == 0 or argslen > 1:
+            return RESPbuilder.error(cmd.name)
+
+        return RESPbuilder.build(args[0])
+
+    def cmdproc_info(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        subcommand = ""
+        if len(args) >= 1:
+            subcommand = args[0].upper()
+
+        if subcommand == "REPLICATION":
+            with self._glock:
+                master_repl_offset = self._master_repl_offset
+            payload = (
+                f"# Replication\r\n"
+                f"role:{self.role}\r\n"
+                f"master_replid:{self._master_replid}\r\n"
+                f"master_repl_offset:{master_repl_offset}\r\n"
+            )
+            response = RESPbuilder.build(payload)
+
+        else:
+            response = RESPbuilder.error(
+                args="not implemented", typ=RESPerror.CUSTOM
+            )
+
+        return response
+
+    def cmdproc_config(self, cmd: Command, args: list, conn = None):
+        subcommand = ""
+        if len(args) >= 1:
+            subcommand = args[0].upper()
+
+        response = None
+
+        if subcommand == "GET":
+            opts = args[1:]
+
+            payload = []
+
+            if len(opts) == 0:
+                payload = self.config.build()
+
+            else:
+                for o in opts:
+                    opt = o.lower()
+                    if opt == "rdbchecksum":
+                        payload += self.config.build_rdbchecksum()
+
+                    elif opt == "dir":
+                        payload += self.config.build_dirpath()
+
+                    elif opt == "dbfilename":
+                        payload += self.config.build_dbfilename()
+
+            response = RESPbuilder.build(payload)
+
+        return response
+
+    def cmdproc_replconf(self, cmd: Command, args: list, conn = None):
+        subcommand = ""
+        if len(args) >= 1:
+            subcommand = args[0].upper()
+
+        response = None
+
+        if subcommand == "GETACK" and args[1] == "*":
+            with self._glock:
+                repl_offset = self._repl_offset
+            response = RESPbuilder.build(["REPLCONF", "ACK", str(repl_offset)])
+
+        elif subcommand == "ACK" and args[1].isdigit():
+            if len(self._replicas) == 0:
+                return RESPbuilder.error(
+                    args="No replicas connected", typ=RESPerror.CUSTOM
+                )
+
+            recvd_offset = int(args[1])
+            with self._glock:
+                master_repl_offset = self._master_repl_offset
+            if recvd_offset >= master_repl_offset:
+                with self._glock:
+                    self._ackcount += 1
+
+            return b""
+
+        else:
+            response = RESPbuilder.build("OK", bulkstr=False)
+
+        return response
+
+    def cmdproc_psync(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        argslen = len(args)
+        if argslen == 1:
+            return RESPbuilder.error(cmd.name)
+        if argslen == 2 and args[0] != "?" and args[1] != "-1":
+            return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+        # Set connection as replica
+        conn.set_replica()
+
+        rdbdata = b""
+        try:
+            rdbpath = self.config.dirpath + "/" + self.config.dbfilename
+            with open(rdbpath, "rb") as f:
+                rdbdata = f.read()
+
+        except FileNotFoundError as e:
+            print(f"RDB file {rdbpath} not found")
+            rdbdata = rdb_contents()
+
+        with self._glock:
+            master_repl_offset = self._master_repl_offset
+
+        return RESPbuilder.build(
+            f"FULLRESYNC {self._master_replid} {master_repl_offset}",
+            bulkstr=False,
+        ) + RESPbuilder.build(rdbdata, rdb=True)
+
+    def cmdproc_wait(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        argslen = len(args)
+        if argslen < 2:
+            return RESPbuilder.error(cmd.name)
+
+        numreplicas = int(args[0])
+        timeout = int(args[1])
+
+        # Send GETACK message to replicas
+        getack_req = RESPbuilder.build(["REPLCONF", "GETACK", "*"])
+        for r in self._replicas:
+            r.send(getack_req)
+
+        with self._glock:
+            self._ackcount = 0
+
+        def poll_func(ev, numreplicas):
+            while True:
+                if ev.is_set():
+                    return
+
+                with self._glock:
+                    if self._ackcount >= numreplicas:
+                        ev.set()
+                        return
+
+        wait_ev = Event()
+
+        poll_thread = Thread(
+            target=poll_func,
+            args=(
+                wait_ev,
+                numreplicas,
+            ),
+        )
+        poll_thread.start()
+
+        wait_ev.wait(timeout / 1000)
+        wait_ev.set()
+
+        poll_thread.join()
+
+        result = self._ackcount if self._ackcount > 0 else len(self._replicas)
+
+        return RESPbuilder.build(int(result))
+
+    def cmdproc_keys(self, cmd: Command, args: list, conn = None):
+        subcommand = ""
+        if len(args) >= 1:
+            subcommand = args[0]
+
+        response = None
+
+        if subcommand == "*":
+            keys = list(self._store.keys())
+            response = RESPbuilder.build(keys)
+
+        return response
+
+    def cmdproc_type(self, cmd: Command, args: list, conn = None):
+        key = ""
+        if len(args) >= 1:
+            key = args[0]
+
+        value_type = self._store.type(key)
+
+        return RESPbuilder.build(value_type, bulkstr=False)
+
+    def cmdproc_xadd(self, cmd: Command, args: list, conn = None):
+        if len(args) < 4:
+            if not conn:
+                return None
+
+            return RESPbuilder.error(cmd.name)
+
+        key = args[0]
+        entry_id = args[1]
+
+        args = args[2:]
+        argslen = len(args)
+
+        entry = Entry(id=entry_id)
+
+        for i in range(0, argslen, 2):
+            k = args[i]
+            if i + 1 < argslen:
+                v = args[i + 1]
+            else:
+                return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+            entry[k] = v
+
+        stored_id = self._store.append(key, entry)
+
+        # Set XADD event
+        if key in self._xadd_streams:
+            self._xadd_streams.remove(key)
+            self._xadd_ev.set()
+
+        if not conn:
+            return None
+
+        return RESPbuilder.build(stored_id)
+
+    def cmdproc_xrange(self, cmd: Command, args: list, conn = None):
+        if len(args) < 3:
+            if not conn:
+                return None
+
+            return RESPbuilder.error(cmd.name)
+
+        key = args[0]
+        start_id = args[1]
+        end_id = args[2]
+
+        stream = self._store.get(key)
+        if not stream:
+            return RESPbuilder.null()
+        if not isinstance(stream, Stream):
+            return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+        start_idx = stream.search(start_id, end=False)
+        end_idx = stream.search(end_id)
+
+        return RESPbuilder.build(stream[start_idx : end_idx + 1])
+
+    def cmdproc_xread(self, cmd: Command, args: list, conn = None):
+        if len(args) < 1:
+            if not conn:
+                return None
+
+            return RESPbuilder.error(cmd.name)
+
+        block = False
+        block_time = 0
+        if "block" in args:
+            block = True
+            block_time = int(args[args.index("block") + 1])
+        elif "BLOCK" in args:
+            block = True
+            block_time = int(args[args.index("BLOCK") + 1])
+
+        start_idx = 0
+        if "streams" in args:
+            start_idx = args.index("streams") + 1
+
+        elif "STREAMS" in args:
+            start_idx = args.index("STREAMS") + 1
+
+        else:
+            if not conn:
+                return None
+
+            return RESPbuilder.error(cmd.name)
+
+        key_id_len = len(args[start_idx:])
+        if key_id_len % 2 != 0:
+            return RESPbuilder.error(
+                args="Unbalanced XREAD list of streams: for each stream "
+                "key an ID or '$' must be specified",
+                typ=RESPerror.CUSTOM,
+            )
+        if key_id_len == 0:
+            return RESPbuilder.error(cmd.name)
+
+        key_id_len = key_id_len // 2
+
+        # extract key, id
+        key_id_list = []
+        for i in range(start_idx, start_idx + key_id_len):
+            key = args[i]
+            id = args[i + key_id_len]
+            key_id_list.append((key, id))
+
+        streams, error = self.get_entries(key_id_list)
+        if error is not None:
+            return error
+
+        if block and len(streams) == 0:
+            for i in range(len(key_id_list)):
+                key, id = key_id_list[i]
+                self._xadd_streams.add(key)
+                if id == "$":
+                    stream = self._store.get(key)
+                    if not stream:
+                        continue
+                    key_id_list[i] = (key, stream[-1]["id"])
+
+            self._xadd_ev.clear()
+            if block_time > 0:
+                self._xadd_ev.wait(block_time / 1000)
+            else:
+                self._xadd_ev.wait()
+
+            self._xadd_streams.clear()
+
+            streams, error = self.get_entries(key_id_list, skip=False)
+            if error is not None:
+                return error
+
+        return (
+            RESPbuilder.build(streams) if len(streams) > 0 else RESPbuilder.null()
+        )
+
+    def cmdproc_set(self, cmd: Command, args: list, conn = None):
+        if len(args) < 2:
+            if not conn:
+                return None
+
+            return RESPbuilder.error(cmd.name)
+
+        expiry = -1
+        if len(args) > 2:
+            expopt = args[2].upper()
+            if expopt == "PX" and len(args) == 4:
+                expiry = millis() + int(args[3])
+            else:
+                if not conn:
+                    return None
+
+                return RESPbuilder.error(typ=RESPerror.SYNTAX)
+
+        self._store.set(args[0], args[1], expiry)
+
+        if not conn:
+            return None
+
+        return RESPbuilder.build("OK", bulkstr=False)
+
+    def cmdproc_get(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        nargs = len(args)
+        if nargs < 1:
+            return RESPbuilder.error(cmd.name)
+
+        if nargs == 1:
+            values = self._store.get(args[0])
+            if isinstance(values, Stream):
+                return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+
+        else:
+            values = []
+            for i in range(nargs):
+                value = self._store.get(args[i])
+                if isinstance(value, Stream):
+                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
+                values.append(value)
+
+        return RESPbuilder.build(values)
+
+    def cmdproc_del(self, cmd: Command, args: list, conn = None):
+        if not conn:
+            return None
+
+        nargs = len(args)
+        if nargs < 1:
+            return RESPbuilder.error(command)
+
+        if nargs == 1:
+            keys_deleted = self._store.delete(args[0])
+
+        else:
+            keys_deleted = 0
+            for i in range(nargs):
+                keys_deleted += self._store.delete(args[i])
+
+        return RESPbuilder.build(keys_deleted)
+    """
+    End of command processors
+    """
+
     def process_command(
         self,
         command: str,
@@ -1370,413 +2058,7 @@ class Server(object):
 
         print(f"Received command {command}, args {args}")
 
-        if command == "COMMAND":
-            if not conn:
-                return None
-
-            response = RESPbuilder.build(["ping", "echo"])
-
-        elif command == "PING":
-            if not conn:
-                return None
-
-            argslen = len(args)
-            if argslen > 1:
-                return RESPerror.error(command)
-
-            if argslen == 1:
-                response = RESPbuilder.build(args[0])
-            else:
-                response = RESPbuilder.build("PONG", bulkstr=False)
-
-        elif command == "ECHO":
-            if not conn:
-                return None
-
-            argslen = len(args)
-            if argslen == 0 or argslen > 1:
-                return RESPbuilder.error(command)
-
-            response = RESPbuilder.build(args[0])
-
-        elif command == "INFO":
-            if not conn:
-                return None
-
-            subcommand = ""
-            if len(args) >= 1:
-                subcommand = args[0].upper()
-
-            if subcommand == "REPLICATION":
-                with self._glock:
-                    master_repl_offset = self._master_repl_offset
-                payload = (
-                    f"# Replication\r\n"
-                    f"role:{self.role}\r\n"
-                    f"master_replid:{self._master_replid}\r\n"
-                    f"master_repl_offset:{master_repl_offset}\r\n"
-                )
-                response = RESPbuilder.build(payload)
-
-            else:
-                response = RESPbuilder.error(
-                    args="not implemented", typ=RESPerror.CUSTOM
-                )
-
-        elif command == "CONFIG":
-            subcommand = ""
-            if len(args) >= 1:
-                subcommand = args[0].upper()
-
-            if subcommand == "GET":
-                opts = args[1:]
-
-                payload = []
-
-                if len(opts) == 0:
-                    payload = self.config.build()
-
-                else:
-                    for o in opts:
-                        opt = o.lower()
-                        if opt == "rdbchecksum":
-                            payload += self.config.build_rdbchecksum()
-
-                        elif opt == "dir":
-                            payload += self.config.build_dirpath()
-
-                        elif opt == "dbfilename":
-                            payload += self.config.build_dbfilename()
-
-                response = RESPbuilder.build(payload)
-
-        elif command == "REPLCONF":
-            subcommand = ""
-            if len(args) >= 1:
-                subcommand = args[0].upper()
-
-            if subcommand == "GETACK" and args[1] == "*":
-                with self._glock:
-                    repl_offset = self._repl_offset
-                response = RESPbuilder.build(["REPLCONF", "ACK", str(repl_offset)])
-
-            elif subcommand == "ACK" and args[1].isdigit():
-                if len(self._replicas) == 0:
-                    return RESPbuilder.error(
-                        args="No replicas connected", typ=RESPerror.CUSTOM
-                    )
-
-                recvd_offset = int(args[1])
-                with self._glock:
-                    master_repl_offset = self._master_repl_offset
-                if recvd_offset >= master_repl_offset:
-                    with self._glock:
-                        self._ackcount += 1
-
-                return b""
-
-            else:
-                response = RESPbuilder.build("OK", bulkstr=False)
-
-        elif command == "PSYNC":
-            if not conn:
-                return None
-
-            argslen = len(args)
-            if argslen == 1:
-                return RESPbuilder.error(command)
-            if argslen == 2 and args[0] != "?" and args[1] != "-1":
-                return RESPbuilder.error(typ=RESPerror.SYNTAX)
-
-            # Set connection as replica
-            conn.set_replica()
-
-            rdbdata = b""
-            try:
-                rdbpath = self.config.dirpath + "/" + self.config.dbfilename
-                with open(rdbpath, "rb") as f:
-                    rdbdata = f.read()
-
-            except FileNotFoundError as e:
-                print(f"RDB file {rdbpath} not found")
-                rdbdata = rdb_contents()
-
-            with self._glock:
-                master_repl_offset = self._master_repl_offset
-            response = RESPbuilder.build(
-                f"FULLRESYNC {self._master_replid} {master_repl_offset}",
-                bulkstr=False,
-            ) + RESPbuilder.build(rdbdata, rdb=True)
-
-        elif command == "WAIT":
-            if not conn:
-                return None
-
-            argslen = len(args)
-            if argslen < 2:
-                return RESPbuilder.error(command)
-
-            numreplicas = int(args[0])
-            timeout = int(args[1])
-
-            # Send GETACK message to replicas
-            getack_req = RESPbuilder.build(["REPLCONF", "GETACK", "*"])
-            for r in self._replicas:
-                r.send(getack_req)
-
-            with self._glock:
-                self._ackcount = 0
-
-            def poll_func(ev, numreplicas):
-                while True:
-                    if ev.is_set():
-                        return
-
-                    with self._glock:
-                        if self._ackcount >= numreplicas:
-                            ev.set()
-                            return
-
-            wait_ev = Event()
-
-            poll_thread = Thread(
-                target=poll_func,
-                args=(
-                    wait_ev,
-                    numreplicas,
-                ),
-            )
-            poll_thread.start()
-
-            wait_ev.wait(timeout / 1000)
-            wait_ev.set()
-
-            poll_thread.join()
-
-            result = self._ackcount if self._ackcount > 0 else len(self._replicas)
-
-            response = RESPbuilder.build(int(result))
-
-        elif command == "KEYS":
-            subcommand = ""
-            if len(args) >= 1:
-                subcommand = args[0]
-
-            if subcommand == "*":
-                keys = list(self._store.keys())
-                response = RESPbuilder.build(keys)
-
-        elif command == "TYPE":
-            key = ""
-            if len(args) >= 1:
-                key = args[0]
-
-            value_type = self._store.type(key)
-
-            response = RESPbuilder.build(value_type, bulkstr=False)
-
-        elif command == "XADD":
-            if len(args) < 4:
-                if not conn:
-                    return None
-
-                return RESPbuilder.error(command)
-
-            key = args[0]
-            entry_id = args[1]
-
-            args = args[2:]
-            argslen = len(args)
-
-            entry = Entry(id=entry_id)
-
-            for i in range(0, argslen, 2):
-                k = args[i]
-                if i + 1 < argslen:
-                    v = args[i + 1]
-                else:
-                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
-
-                entry[k] = v
-
-            stored_id = self._store.append(key, entry)
-
-            # Set XADD event
-            if key in self._xadd_streams:
-                self._xadd_streams.remove(key)
-                self._xadd_ev.set()
-
-            if not conn:
-                return None
-
-            response = RESPbuilder.build(stored_id)
-
-        elif command == "XRANGE":
-            if len(args) < 3:
-                if not conn:
-                    return None
-
-                return RESPbuilder.error(command)
-
-            key = args[0]
-            start_id = args[1]
-            end_id = args[2]
-
-            stream = self._store.get(key)
-            if not stream:
-                return RESPbuilder.null()
-            if not isinstance(stream, Stream):
-                return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
-
-            start_idx = stream.search(start_id, end=False)
-            end_idx = stream.search(end_id)
-
-            response = RESPbuilder.build(stream[start_idx : end_idx + 1])
-
-        elif command == "XREAD":
-            if len(args) < 1:
-                if not conn:
-                    return None
-
-                return RESPbuilder.error(command)
-
-            block = False
-            block_time = 0
-            if "block" in args:
-                block = True
-                block_time = int(args[args.index("block") + 1])
-            elif "BLOCK" in args:
-                block = True
-                block_time = int(args[args.index("BLOCK") + 1])
-
-            start_idx = 0
-            if "streams" in args:
-                start_idx = args.index("streams") + 1
-
-            elif "STREAMS" in args:
-                start_idx = args.index("STREAMS") + 1
-
-            else:
-                if not conn:
-                    return None
-
-                return RESPbuilder.error(command)
-
-            key_id_len = len(args[start_idx:])
-            if key_id_len % 2 != 0:
-                return RESPbuilder.error(
-                    args="Unbalanced XREAD list of streams: for each stream "
-                    "key an ID or '$' must be specified",
-                    typ=RESPerror.CUSTOM,
-                )
-            if key_id_len == 0:
-                return RESPbuilder.error(command)
-
-            key_id_len = key_id_len // 2
-
-            key_id_list = []
-            for i in range(start_idx, start_idx + key_id_len):
-                key = args[i]
-                id = args[i + key_id_len]
-                key_id_list.append((key, id))
-
-            streams, error = self.get_entries(key_id_list)
-            if error is not None:
-                return error
-
-            if block and len(streams) == 0:
-                for i in range(len(key_id_list)):
-                    key, id = key_id_list[i]
-                    self._xadd_streams.add(key)
-                    if id == "$":
-                        stream = self._store.get(key)
-                        if not stream:
-                            continue
-                        key_id_list[i] = (key, stream[-1]["id"])
-
-                self._xadd_ev.clear()
-                if block_time > 0:
-                    self._xadd_ev.wait(block_time / 1000)
-                else:
-                    self._xadd_ev.wait()
-
-                self._xadd_streams.clear()
-                
-                streams, error = self.get_entries(key_id_list, skip=False)
-                if error is not None:
-                    return error
-
-            response = (
-                RESPbuilder.build(streams) if len(streams) > 0 else RESPbuilder.null()
-            )
-
-        elif command == "SET":
-            if len(args) < 2:
-                if not conn:
-                    return None
-
-                return RESPbuilder.error(command)
-
-            expiry = -1
-            if len(args) > 2:
-                expopt = args[2].upper()
-                if expopt == "PX" and len(args) == 4:
-                    expiry = millis() + int(args[3])
-                else:
-                    if not conn:
-                        return None
-
-                    return RESPbuilder.error(typ=RESPerror.SYNTAX)
-
-            self._store.set(args[0], args[1], expiry)
-
-            if not conn:
-                return None
-
-            response = RESPbuilder.build("OK", bulkstr=False)
-
-        elif command == "GET":
-            if not conn:
-                return None
-
-            nargs = len(args)
-            if nargs < 1:
-                return RESPbuilder.error(command)
-
-            if nargs == 1:
-                values = self._store.get(args[0])
-                if isinstance(values, Stream):
-                    return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
-
-            else:
-                values = []
-                for i in range(nargs):
-                    value = self._store.get(args[i])
-                    if isinstance(value, Stream):
-                        return RESPbuilder.error(typ=RESPerror.WRONGTYPE)
-                    values.append(value)
-
-            response = RESPbuilder.build(values)
-
-        elif command == "DEL":
-            if not conn:
-                return None
-
-            nargs = len(args)
-            if nargs < 1:
-                return RESPbuilder.error(command)
-
-            if nargs == 1:
-                keys_deleted = self._store.delete(args[0])
-
-            else:
-                keys_deleted = 0
-                for i in range(nargs):
-                    keys_deleted += self._store.delete(args[i])
-
-            response = RESPbuilder.build(keys_deleted)
-
-        return response
+        return self._cmd_processor(command, args, conn)
 
     def check_expiry(self):
         CHECK_INTERVAL = 300  # seconds
