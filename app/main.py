@@ -1458,6 +1458,8 @@ class Server(object):
         self._port = port
         self._role = role
 
+        self._socket = None
+
         self._xadd_ev = Event()
         self._xadd_streams = set()
 
@@ -1466,9 +1468,6 @@ class Server(object):
         self._expiry_thread = None
 
         self._master_conn = None
-        """
-        This attribute does not need thread locking as 
-        """
         self._repl_offset = 0
         self._replicas = []
         self._ackcount = 0
@@ -1513,7 +1512,7 @@ class Server(object):
         self._expiry_thread = Thread(target=self.check_expiry)
         self._expiry_thread.start()
 
-        return socket.create_server(
+        self._socket = socket.create_server(
             (self._host, self._port),
             backlog=backlog,
             reuse_port=True
@@ -1527,6 +1526,10 @@ class Server(object):
         with self._expiry_cv:
             self._expiry_cv.notify()
         self._expiry_thread.join()
+
+    def accept(self):
+        client_socket, addr = self._socket.accept()
+        return Connection(client_socket, addr, self)
 
     def add_replica(self, conn: Connection):
         self._replicas.append(conn)
@@ -2202,16 +2205,16 @@ def main():
         master_port = int(args.replicaof[1])
         server.connect_master(master_host, master_port)
 
-    server_socket = server.start(backlog=2)
+    server.start(backlog=0)
 
     MAX_CONCURRENT_CONN = 15
     tpool = ThreadPool(max_workers=MAX_CONCURRENT_CONN)
     try:
         while True:
             if (tpool.qsize() < MAX_CONCURRENT_CONN):
-                client_socket, addr = server_socket.accept()
-                print("Incoming connection from", addr)
-                tpool.submit(Connection(client_socket, addr, server))
+                connection = server.accept()
+                print("Incoming connection from", connection.addr)
+                tpool.submit(connection)
 
     except KeyboardInterrupt as intr:
         print("Caught Ctrl-C... Exiting")
