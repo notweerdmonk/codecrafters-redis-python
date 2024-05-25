@@ -1104,7 +1104,7 @@ class Command(object):
             self.extract(tokens)
 
     def __call__(self, args: list, conn = None):
-        self._processor(args, conn)
+        self.processor(self, args, conn)
 
     def build(self):
         return [
