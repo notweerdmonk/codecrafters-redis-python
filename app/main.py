@@ -1088,7 +1088,7 @@ class Command(object):
         step: int = None,
         tokens: list = None
     ):
-        if not callable(processor):
+        if processor is not None and not callable(processor):
             raise ValueError("Argument processor should be callable")
         self.processor = processor
 
@@ -1103,8 +1103,11 @@ class Command(object):
         else:
             self.extract(tokens)
 
-    def __call__(self, args: list, conn = None):
-        self.processor(self, args, conn)
+    def __call__(self, cmdargs: list, *args):
+        return (
+            None if self.processor is None
+            else self.processor(self, cmdargs, *args)
+        )
 
     def build(self):
         return [
@@ -1160,7 +1163,8 @@ class Cmdprocessor(list):
     def __call__(self, command: str, cmdargs: list, *args):
         for cmd in self:
             if command == cmd.name:
-                return cmd.processor(cmd, cmdargs, *args)
+                return cmd(cmdargs, *args)
+        return None
 
     def build(self):
         commands = []
